@@ -59,7 +59,7 @@ def create_clients_shards(dataset, K=20, shards=100):
     shard_idxs = [sorted_idx[i * shard_size:(i + 1) * shard_size] for i in range(shards)]
     random.shuffle(shard_idxs)
     clients = {}
-    for i in range(K):
+    for i in tqdm(range(K),desc="Creating clients"):
         # each client gets 2 shards
         clients[i] = np.concatenate(shard_idxs[2 * i:2 * i + 2])
     return clients
@@ -94,9 +94,146 @@ class SimpleCNN(nn.Module):
         x = F.relu(self.fc2(x))
         return self.fc3(x)
 
+class Kappa(nn.Module):
+    """Auxiliary classifier mapping flattened phi features -> class logits."""
+    def __init__(self, feature_shape, num_classes=10):
+        super().__init__()
+        flat = int(np.prod(feature_shape))
+        self.fc = nn.Linear(flat, num_classes)
+
+    def forward(self, h):
+        return self.fc(torch.flatten(h, 1))
+
+def probe_phi_feature_shape(phi_module, in_channels=1, img_size=28, device='cpu'):
+    """Run a dummy forward to get the (C,H,W) feature shape produced by phi."""
+    phi_module = phi_module.to(device)
+    phi_module.eval()
+    with torch.no_grad():
+        sample = torch.randn(1, in_channels, img_size, img_size).to(device)
+        feat = phi_module(sample)
+        return tuple(feat.shape[1:])  # (C,H,W)
+
+class Phi(nn.Module):
+    """
+    Client-side feature extractor: reuse first conv blocks of SimpleCNN.
+    We will instantiate Phi from a 'base' SimpleCNN instance to reuse conv layers.
+    """
+    def __init__(self, base: SimpleCNN):
+        super().__init__()
+        # first four conv blocks from the base network
+        self.net = nn.Sequential(
+            base.conv1, nn.ReLU(),
+            base.pool,
+            base.conv2, nn.ReLU(),
+            base.pool,
+            base.conv3, nn.ReLU(),
+            base.conv4, nn.ReLU()
+        )
+
+    def forward(self, x):
+        return self.net(x)
 # ----------------------------
 # DataLoader helpers
 # ----------------------------
+
+
+def train_phi_kappa_local(batch=None, lr=None):
+    """
+    Train phi + kappa locally for each client (no server).
+    Returns list of state_dicts for phi and list for kappa (CPU).
+    """
+    # 1) Build base model and phi template
+    base = SimpleCNN(in_channels=IN_CHANNELS).to(device)
+    phi_template = Phi(base).to(device)
+
+    # 2) probe feature shape so we can create Kappa
+    feat_shape = probe_phi_feature_shape(Phi(base), in_channels=IN_CHANNELS, img_size=IMG_SIZE, device=device)
+
+    # 3) create client phi and kappa modules
+    clients_phi = [deepcopy(phi_template).to(device) for _ in range(K)]
+    clients_kappa = [Kappa(feat_shape, num_classes=10).to(device) for _ in range(K)]
+
+    # Initialize all kappa the same (optional)
+    # common_kappa_state = deepcopy(clients_kappa[0].state_dict())
+
+    phi_states_cpu = []
+    kappa_states_cpu = []
+
+    for k in tqdm(range(K), desc="Training Clients (phi+kappa training)"):
+        phi = clients_phi[k]
+        kappa = clients_kappa[k]
+        # initialize from template (they already are)
+        # set up optimizer for phi + kappa
+        opt = optim.SGD(list(phi.parameters()) + list(kappa.parameters()), lr=lr)
+
+        loader = get_client_loader(k, batch=batch)
+        phi.train()
+        kappa.train()
+        for r in tqdm(range(ROUNDS),desc=f"Client {k} rounds", leave=False):
+            for _ in tqdm(range(LOCAL_EPOCHS),desc=f"Client {k} local epochs", leave=False):
+                for xb, yb in loader:
+                    # ensure tensors
+                    xb = xb.to(device)
+                    # some dataset variants may return ints for yb if batch_size=1
+                    if not torch.is_tensor(yb):
+                        yb = torch.tensor(yb, dtype=torch.long)
+                    yb = yb.to(device)
+
+                    h = phi(xb)
+                    out = kappa(h)
+                    loss = F.cross_entropy(out, yb)
+                    opt.zero_grad()
+                    loss.backward()
+                    opt.step()
+        # after local training, save CPU copies of state_dicts
+        phi_states_cpu.append({name: param.cpu().clone() for name, param in phi.state_dict().items()})
+        kappa_states_cpu.append({name: param.cpu().clone() for name, param in kappa.state_dict().items()})
+        # free GPU memory for next client
+        del phi, kappa, opt
+        torch.cuda.empty_cache()
+
+    return phi_states_cpu, kappa_states_cpu
+def evaluate_phi_kappa_local(phi_states,
+                             kappa_states,
+                             per_client_testsets,
+                             batch_size=None):
+    """
+    Evaluate local phi+kappa for each client, return average accuracy.
+    phi_states, kappa_states: lists of cpu state_dicts (length K)
+    per_client_testsets: list of Subset (length K)
+    """
+    accs = []
+    for k in tqdm(range(K),desc="Evaluating phi+kappa models"):
+        # rebuild phi and kappa on device, load state
+        base = SimpleCNN(in_channels=IN_CHANNELS).to(device)
+        phi = Phi(base).to(device)
+        feat_shape = probe_phi_feature_shape(Phi(base), in_channels=IN_CHANNELS, img_size=IMG_SIZE, device=device)
+        kappa = Kappa(feat_shape).to(device)
+
+        phi.load_state_dict(phi_states[k])
+        kappa.load_state_dict(kappa_states[k])
+        phi.eval()
+        kappa.eval()
+
+        correct = 0
+        total = 0
+        loader = DataLoader(per_client_testsets[k], batch_size=batch_size, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+        with torch.no_grad():
+            for xb, yb in loader:
+                xb = xb.to(device)
+                if not torch.is_tensor(yb):
+                    yb = torch.tensor(yb, dtype=torch.long)
+                yb = yb.to(device)
+                h = phi(xb)
+                out = kappa(h)
+                pred = out.argmax(dim=1)
+                correct += (pred == yb).sum().item()
+                total += yb.size(0)
+        accs.append(correct/total if total>0 else 0.0)
+        del phi, kappa
+        torch.cuda.empty_cache()
+
+    return float(np.mean(accs))
 def get_client_loader(client_idx, batch=None):
     idxs = clients_indices[client_idx]
     subset = Subset(trainset, idxs)
@@ -146,7 +283,7 @@ def train_personalized_local_only(batch=None):
         model.train()
 
         for r in tqdm(range(ROUNDS), desc=f"Client {k} rounds", leave=False):
-            for _ in range(LOCAL_EPOCHS):
+            for _ in tqdm(range(LOCAL_EPOCHS),desc=f"Client {k} local epochs", leave=False):
                 for xb, yb in loader:
                     xb, yb = xb.to(device), yb.to(device)
                     out = model(xb)
@@ -173,7 +310,7 @@ def evaluate_method_full_models(clients_state_dicts, per_client_testsets,batch_s
     returns average accuracy across clients
     """
     accs = []
-    for k in range(K):
+    for k in tqdm(range(K),desc="Evaluating personalized models"):
         state = clients_state_dicts[k]
         model = SimpleCNN(in_channels=IN_CHANNELS).to(device)
         model.load_state_dict(state)
@@ -198,9 +335,9 @@ if __name__=='__main__':
     # Config (change these)
     # ----------------------------
     DATASET = "CIFAR10"  # options: "MNIST", "FMNIST", "CIFAR10"
-    K = 5 #20  # number of clients (paper uses 50)
+    K =5 #50  # number of clients (paper uses 50)
     SHARDS = 100  # number of shards (paper uses 100)
-    ROUNDS = 5 #30  # global rounds (paper: 120 for MNIST; increase for better accuracy)
+    ROUNDS =10 #800  # global rounds (paper: 120 for MNIST; increase for better accuracy)
     LOCAL_EPOCHS = 1
     BATCH = 50
     LR = 0.01
@@ -213,7 +350,7 @@ if __name__=='__main__':
     p_values = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
 
     # output files
-    OUT_DIR = f"results_personalized_{DATASET}"
+    OUT_DIR = f"Phi+Kappa_(local-only)_{DATASET}"
     os.makedirs(OUT_DIR, exist_ok=True)
 
     trainset, testset, IN_CHANNELS, IMG_SIZE = get_datasets(DATASET)
@@ -229,32 +366,47 @@ if __name__=='__main__':
         print("Building test sets for p =", p)
         per_p_testsets[p] = [client_test_set_for_p(k, p) for k in range(K)]
 
+    print("Training phi + kappa locally (no server)...")
+    phi_states, kappa_states = train_phi_kappa_local(batch=BATCH, lr=LR)
+
+    results_phi_kappa = []
+    for p in p_values:
+        avg_acc = evaluate_phi_kappa_local(phi_states, kappa_states, per_p_testsets[p], batch_size=BATCH)
+        print(f"p={p:.2f} phi+kappa avg acc: {avg_acc:.4f}")
+        results_phi_kappa.append(avg_acc)
+
+    df = pd.DataFrame({'Phi+Kappa (local-only)': results_phi_kappa}, index=p_values)
+    df.index.name = 'p'
+    df.to_csv(os.path.join(OUT_DIR, 'phi_kappa_results.csv'))
+    # plot ...
+    print(list(df))
         # Train personalized models
     print("Training personalized (local-only) models ...")
-    personal_states = train_personalized_local_only(batch=BATCH)
+
+    # personal_states = train_personalized_local_only(batch=BATCH)
 
     # Evaluate for each p
-    results = {}
-    for p in p_values:
-        avg_acc = evaluate_method_full_models(personal_states, per_p_testsets[p],batch_size=BATCH)
-        results.setdefault("Personalized", []).append(avg_acc)
-        print(f"p={p:.2f} Personalized avg acc: {avg_acc:.4f}")
+    # results = {}
+    # for p in p_values:
+    #     avg_acc = evaluate_method_full_models(personal_states, per_p_testsets[p],batch_size=BATCH)
+    #     results.setdefault("Personalized", []).append(avg_acc)
+    #     print(f"p={p:.2f} Personalized avg acc: {avg_acc:.4f}")
 
-    # Save results and plot
-    df = pd.DataFrame(results, index=p_values)
-    df.index.name = "p"
-    csv_path = os.path.join(OUT_DIR, f"personalized_results.csv")
-    df.to_csv(csv_path)
-    print("Saved CSV ->", csv_path)
+    # # Save results and plot
+    # df = pd.DataFrame(results, index=p_values)
+    # df.index.name = "p"
+    # csv_path = os.path.join(OUT_DIR, f"personalized_results.csv")
+    # df.to_csv(csv_path)
+    # print("Saved CSV ->", csv_path)
 
     # quick plot
     plt.figure(figsize=(6, 4))
-    plt.plot(p_values, results["Personalized"], marker='o', label="Personalized")
+    plt.plot(p_values, df['Phi+Kappa (local-only)'], marker='o', label="Phi+Kappa (local-only)")
     plt.xlabel("p (relative portion of OOD samples)")
     plt.ylabel("Avg client test accuracy")
-    plt.title("Personalized FL: Accuracy vs p")
+    plt.title("Phi+Kappa (local-only): Accuracy vs p")
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(OUT_DIR, "personalized_accuracy_vs_p.png"), dpi=200)
+    plt.savefig(os.path.join(OUT_DIR, "phi_kappa_accuracy_vs_p.png"), dpi=200)
     plt.show()
