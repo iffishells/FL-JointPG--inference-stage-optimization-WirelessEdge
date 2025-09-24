@@ -7,7 +7,7 @@ on MNIST with shard-based non-IID partitioning. Produces Accuracy vs p plot.
 Note: This is a simplified reproduction for research/dev. You can scale K/rounds to match paper.
 """
 import os
-
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,9 +29,9 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("Device:", device)
 
-K = 20  # number of clients (set to 50 for paper-scale; reduced here for speed)
+K = 50  # number of clients (set to 50 for paper-scale; reduced here for speed)
 SHARDS = 100  # number of shards (paper used 100)
-ROUNDS = 20  # global rounds (paper: 120 for MNIST) -> increase to 120 for full replicate
+ROUNDS = 800  # global rounds (paper: 120 for MNIST) -> increase to 120 for full replicate
 LOCAL_EPOCHS = 1  # epochs per round per client (paper uses 1 epoch per round)
 BATCH = 50  # mini-batch as in paper
 LR = 0.01
@@ -39,7 +39,7 @@ GAMMA = 0.5  # multi-exit weight in objective (paper commonly uses 0.5)
 LAMBDA_SPLITGP = 0.2  # personalization weight for SplitGP
 SEED = 42
 
-p_values = [0.0, 0.2, 0.4, 0.6, 0.8]  # values requested
+p_values = [0.0, 0.2, 0.4, 0.6, 0.8,1]  # values requested
 
 random.seed(SEED)
 np.random.seed(SEED)
@@ -260,7 +260,7 @@ def train_personalized_local_only():
         opt = optim.SGD(model.parameters(), lr=LR)
         loader = get_client_loader(k)
         model.train()
-        for r in tqdm(range(ROUNDS),desc=f"Client {k} rounds", leave=False):
+        for r in tqdm(range(ROUNDS),desc=f"(train_personalized_local_only) Client {k} rounds", leave=False):
             for _ in tqdm(range(LOCAL_EPOCHS),desc=f"Client {k} local epochs", leave=False):
                 for xb, yb in loader:
                     xb, yb = xb.to(device), yb.to(device)
@@ -280,21 +280,21 @@ def train_fedavg_global():
     global_model = BaseCNN().to(device)
     global_state = deepcopy(global_model.state_dict())
 
-    for r in range(ROUNDS):
+    for r in tqdm(range(ROUNDS),desc=" Rounds train_fedavg_global"):
         client_states = []
-        for k in range(K):
+        for k in tqdm(range(K),desc=" Clients train_fedavg_global"):
             model = BaseCNN().to(device)
             model.load_state_dict(global_state)
             opt = optim.SGD(model.parameters(), lr=LR)
             loader = get_client_loader(k)
             model.train()
-            for _ in range(LOCAL_EPOCHS):
+            for _ in tqdm(range(LOCAL_EPOCHS),desc=f"(train_fedavg_global) Client {k} local epochs", leave=False):
                 for xb, yb in loader:
                     xb, yb = xb.to(device), yb.to(device)
                     out = model(xb)
                     loss = F.cross_entropy(out, yb)
-                    opt.zero_grad();
-                    loss.backward();
+                    opt.zero_grad()
+                    loss.backward()
                     opt.step()
             client_states.append(deepcopy(model.state_dict()))
         # aggregate by simple average
@@ -330,12 +330,12 @@ def train_split_training(lambda_personalization=0.2):
     kappa_state = deepcopy(clients_kappa[0].state_dict())
     theta_state = deepcopy(theta_template.state_dict())
 
-    for r in range(ROUNDS):
+    for r in tqdm(range(ROUNDS),desc=" Rounds train_split_training"):
         # per-client local updates
         client_phi_states = []
         client_kappa_states = []
         client_theta_states = []
-        for k in range(K):
+        for k in tqdm(range(K),desc=" Clients train_split_training",leave=False):
             # load current states
             clients_phi[k].load_state_dict(phi_state)
             clients_kappa[k].load_state_dict(kappa_state)
@@ -348,7 +348,7 @@ def train_split_training(lambda_personalization=0.2):
             clients_phi[k].train()
             clients_kappa[k].train()
             server_theta.train()
-            for _ in range(LOCAL_EPOCHS):
+            for _ in tqdm(range(LOCAL_EPOCHS),desc=f"Client {k} local epochs", leave=False):
                 for xb, yb in loader:
                     xb, yb = xb.to(device), yb.to(device)
                     h = clients_phi[k](xb)
@@ -436,7 +436,7 @@ def run_all():
         print(f"p={p:.2f} FedAvg avg acc: {avg_acc:.4f}")
 
     # # 3) Multi-Exit NN via split with lambda=0 (no personalization)
-    print("Training Multi-Exit (split, lambda=0)...")
+    print("\n\nTraining Multi-Exit (split, lambda=0)...")
     clients_phi_me, clients_kappa_me, server_theta_me = train_split_training(lambda_personalization=0.0)
     for p in tqdm(p_values,desc="Evaluating p values (Training Multi-Exit (split, lambda=0)...)"):
         full_acc, client_acc = evaluate_method_split(clients_phi_me, clients_kappa_me, server_theta_me, per_p_testsets[p])
@@ -446,7 +446,7 @@ def run_all():
 
     # 4) SplitGP (lambda = 0.2)
 
-    print("Training SplitGP (lambda=0.2)...")
+    print("\n\nTraining SplitGP (lambda=0.2)...")
     clients_phi_sgp, clients_kappa_sgp, server_theta_sgp = train_split_training(lambda_personalization=LAMBDA_SPLITGP)
     for p in tqdm(p_values,desc="Evaluating p values (Training SplitGP (lambda=0.2)...)"):
         full_acc, client_acc = evaluate_method_split(clients_phi_sgp, clients_kappa_sgp, server_theta_sgp, per_p_testsets[p])
@@ -500,10 +500,17 @@ if __name__ == "__main__":
     train_labels = np.array(trainset.targets)
     test_labels = np.array(testset.targets)
     results = run_all()
-
-    # Plot
     plot_dir_name = 'plots'
     os.makedirs(plot_dir_name, exist_ok=True)
+
+    results_df = pd.DataFrame(results, index=p_values)
+    results_df.index.name = "p"
+    csv_path = f"{plot_dir_name}/accuracy_vs_p.csv"
+    results_df.to_csv(csv_path)
+    print(f"Results saved to {csv_path}")
+
+
+    # Plot
     plt.figure(figsize=(8, 6))
     for method, accs in results.items():
         plt.plot(p_values, accs, marker='o', label=method)
