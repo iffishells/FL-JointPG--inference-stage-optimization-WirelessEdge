@@ -11,6 +11,11 @@ datasets
 __pycache__/
 *.py[codz]
 *$py.class
+*.xml
+../.idea
+.venv
+.ipynb_checkpoints
+.idea
 
 # C extensions
 *.so
