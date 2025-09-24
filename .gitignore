@@ -2,6 +2,12 @@
 # Byte-compiled / optimized / DLL files
 .idea
 *.xml
+myenv
+*.tar.gz
+*.meta
+data
+datasets
+.idea
 __pycache__/
 *.py[codz]
 *$py.class
