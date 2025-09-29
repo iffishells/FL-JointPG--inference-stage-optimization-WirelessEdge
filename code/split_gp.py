@@ -91,6 +91,7 @@ def parse_args():
     parser.add_argument("--gpu", type=str, default="0", help="Which GPU id(s) to use (e.g. '0' or '0,1')")
     parser.add_argument("--num-workers", type=int, default=4, help="Dataloader workers")
     parser.add_argument("--no-pin-memory", action="store_true", help="Disable pin_memory in DataLoader")
+    parser.add_argument("--eth", type=float, default=0.5, help="Entropy threshold (Eth) for selective offloading") # <--- ADD THIS LINE
 
     # Model toggles
     parser.add_argument("--small-classifier", action="store_true", help="Use smaller FC layers (avoid OOM)")
@@ -100,6 +101,9 @@ def parse_args():
     parser.add_argument("--method", type=str, default="splitgp",
                         choices=["splitgp", "multi-exit", "personalized", "fedavg", "all"],
                         help="Which training method to run")
+    parser.add_argument("--split_index", type=int, default=11, help="SplitIndex") # <--- ADD THIS LINE
+
+
 
     return parser.parse_args()
 # -------------------------
@@ -289,7 +293,14 @@ def evaluate_method_full_models(clients_state_dicts, per_client_testsets, in_cha
         torch.cuda.empty_cache()
     return float(np.mean(accs))
 
-def evaluate_method_split(clients_phi_states, clients_kappa_states, server_theta_state, per_client_testsets, in_channels, img_size, split_index, batch_size=None):
+def evaluate_method_split(clients_phi_states,
+                          clients_kappa_states,
+                          server_theta_state,
+                          per_client_testsets,
+                          in_channels,
+                          img_size,
+                          split_index,
+                          batch_size=None):
     """
     Evaluate split model:
       - full model output computed by phi -> server_theta (server-side prediction)
@@ -315,7 +326,10 @@ def evaluate_method_split(clients_phi_states, clients_kappa_states, server_theta
         kappa.load_state_dict({kk: vv.to(DEVICE) for kk, vv in clients_kappa_states[k].items()})
         phi.eval(); kappa.eval()
 
-        correct_full = 0; correct_client = 0; total = 0
+        correct_full = 0
+        correct_client = 0
+        total = 0
+        threshold = 0.2
         loader = DataLoader(per_client_testsets[k], batch_size=batch_size, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
         with torch.no_grad():
             for xb, yb in loader:
@@ -325,6 +339,8 @@ def evaluate_method_split(clients_phi_states, clients_kappa_states, server_theta
                 yb = yb.to(DEVICE)
 
                 h = phi(xb)
+
+
                 out_c = kappa(h).argmax(1)
                 out_s = server_theta(h).argmax(1)
                 correct_client += (out_c == yb).sum().item()
@@ -340,88 +356,115 @@ def evaluate_method_split(clients_phi_states, clients_kappa_states, server_theta
     torch.cuda.empty_cache()
     return float(np.mean(full_accs)), float(np.mean(client_accs))
 
-# -------------------------
-# Training functions
-# -------------------------
-def train_personalized_local_only(in_channels, img_size, batch=None, rounds=None, lr=None):
-    """Each client trains a full VGG model locally starting from same init."""
-    base_template = VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
-    init_state = deepcopy(base_template.state_dict())
-    client_states = []
 
-    for k in tqdm(range(K), desc="Clients (personalized training)"):
-        model = VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
-        model.load_state_dict(init_state)
-        opt = optim.SGD(model.parameters(), lr=lr)
-        loader = get_client_loader(k, batch=batch)
-        model.train()
 
-        for r in range(rounds):
-            for _ in range(LOCAL_EPOCHS):
-                for xb, yb in loader:
-                    xb = xb.to(DEVICE)
-                    if not torch.is_tensor(yb):
-                        yb = torch.tensor(yb, dtype=torch.long)
-                    yb = yb.to(DEVICE)
-                    out = model(xb)
-                    loss = F.cross_entropy(out, yb)
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
 
-        # save CPU copy
-        state_cpu = {kname: v.cpu().clone() for kname, v in model.state_dict().items()}
-        client_states.append(state_cpu)
-        del model, opt
+def evaluate_method_split(clients_phi_states,
+                          clients_kappa_states,
+                          server_theta_state,
+                          per_client_testsets,
+                          in_channels,
+                          img_size,
+                          split_index,
+                          threshold,  # <--- NEW ARGUMENT (Eth)
+                          batch_size=None):
+    """
+    Evaluate split model:
+      - full model output computed by phi -> server_theta (server-side prediction)
+      - client-side prediction phi -> kappa
+    Return (avg_server_full_acc, avg_client_acc, avg_selective_acc)
+    """
+    # rebuild server theta (same as before)
+    base = VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
+    server_theta = Theta(base, split_index=split_index).to(DEVICE)
+    server_theta.load_state_dict({k: v.to(DEVICE) for k, v in server_theta_state.items()})
+    server_theta.eval()
+
+    full_accs = []
+    client_accs = []
+    selective_accs = []  # <--- MODIFIED TO INCLUDE SELECTIVE
+
+    for k in range(K):
+        # ... (rebuild phi & kappa - same as before)
+        base_local = VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
+        phi = Phi(base_local, split_index=split_index).to(DEVICE)
+        feat_shape = probe_phi_feature_shape(phi, in_channels=in_channels, img_size=img_size, device=DEVICE)
+        kappa = Kappa(feat_shape, num_classes=10).to(DEVICE)
+
+        phi.load_state_dict({kk: vv.to(DEVICE) for kk, vv in clients_phi_states[k].items()})
+        kappa.load_state_dict({kk: vv.to(DEVICE) for kk, vv in clients_kappa_states[k].items()})
+        phi.eval()
+        kappa.eval()
+
+        correct_full = 0
+        correct_client = 0
+        correct_selective = 0
+        total = 0  # <--- ADD correct_selective
+        loader = DataLoader(per_client_testsets[k], batch_size=batch_size, num_workers=NUM_WORKERS,
+                            pin_memory=PIN_MEMORY)
+
+        with torch.no_grad():
+            for xb, yb in loader:
+                xb = xb.to(DEVICE)
+                if not torch.is_tensor(yb):
+                    yb = torch.tensor(yb, dtype=torch.long)
+                yb = yb.to(DEVICE)
+
+                h = phi(xb)
+
+                # Get soft outputs from both paths
+                out_c_soft = kappa(h)  # Client (kappa) soft output
+                out_s_soft = server_theta(h)  # Server (theta) soft output
+
+                # Calculate predictions
+                pred_c = out_c_soft.argmax(dim=1)
+                pred_s = out_s_soft.argmax(dim=1)
+
+                # --- SplitGP Selective Offloading Logic ---
+                # 1. Compute Shannon Entropy (E) for Client's prediction (Uncertainty)
+                probs_c = F.softmax(out_c_soft, dim=1)
+                # Shannon Entropy E = - sum(p * log2(p)). Add 1e-12 for numerical stability.
+                entropy = -torch.sum(probs_c * torch.log2(probs_c + 1e-12), dim=1)
+                # 2. Decision Mask: Offload if Uncertainty (E) >= Threshold (Eth)
+                offload_mask = entropy >= threshold
+
+                # 3. Final Prediction is selected based on the mask
+                final_pred = torch.where(offload_mask, pred_s, pred_c)
+
+                # Update Accuracy Counts
+                correct_client += (pred_c == yb).sum().item()
+                correct_full += (pred_s == yb).sum().item()
+                correct_selective += (final_pred == yb).sum().item()  # <--- Selective Accuracy
+                total += yb.size(0)
+
+        client_accs.append(correct_client / total if total > 0 else 0.0)
+        full_accs.append(correct_full / total if total > 0 else 0.0)
+        selective_accs.append(correct_selective / total if total > 0 else 0.0)  # <--- Append Selective Acc
+
+        del phi, kappa, base_local
         torch.cuda.empty_cache()
-    return client_states
 
-def train_fedavg_global(in_channels, img_size, batch=None, rounds=None, lr=None):
-    """Standard FedAvg training of full VGG model (global)."""
-    global_model = VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
-    global_state = deepcopy(global_model.state_dict())
-
-    for r in tqdm(range(rounds), desc="FedAvg rounds"):
-        client_states = []
-        for k in range(K):
-            model = VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
-            model.load_state_dict({kk: vv.to(DEVICE) for kk, vv in global_state.items()})
-            opt = optim.SGD(model.parameters(), lr=lr)
-            loader = get_client_loader(k, batch=batch)
-            model.train()
-            for _ in range(LOCAL_EPOCHS):
-                for xb, yb in loader:
-                    xb = xb.to(DEVICE)
-                    if not torch.is_tensor(yb):
-                        yb = torch.tensor(yb, dtype=torch.long)
-                    yb = yb.to(DEVICE)
-                    out = model(xb)
-                    loss = F.cross_entropy(out, yb)
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-            client_states.append({kname: v.cpu().clone() for kname, v in model.state_dict().items()})
-            del model, opt
-            torch.cuda.empty_cache()
-
-        # simple average on CPU
-        new_state = {}
-        keys = client_states[0].keys()
-        for key in keys:
-            s = sum(client_states[i][key].to(torch.float32) for i in range(K))
-            new_state[key] = (s / K).clone()
-        global_state = new_state
-        global_model.load_state_dict({k: v.to(DEVICE) for k, v in global_state.items()})
-    # return CPU state
-    return {k: v.cpu().clone() for k, v in global_state.items()}
+    del server_theta
+    torch.cuda.empty_cache()
+    # <--- RETURN SELECTIVE ACCURACY
+    return float(np.mean(full_accs)), float(np.mean(client_accs)), float(np.mean(selective_accs))
 
 def train_split_training(in_channels, img_size, split_index,
                          lambda_personalization=None,
-                         gamma=None, lr=None, batch=None, rounds=None):
+                         gamma=None,
+                         lr=None,
+                         batch=None,
+                         rounds=None,
+                         client_loader=None):
     """
     SplitGP style training.
     Returns (clients_phi_states_cpu, clients_kappa_states_cpu, server_theta_state_cpu)
     """
+
+    # sanity check
+    if client_loader is None:
+        raise ValueError("client_loaders must be provided (list or dict of DataLoaders indexed by client id)")
+
     # base model
     base = VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
     phi_template = Phi(base, split_index=split_index).to(DEVICE)
@@ -456,8 +499,12 @@ def train_split_training(in_channels, img_size, split_index,
                             list(clients_kappa[k].parameters()) +
                             list(server_theta.parameters()), lr=lr)
 
-            loader = get_client_loader(k, batch=batch)
-            clients_phi[k].train(); clients_kappa[k].train(); server_theta.train()
+            # loader = get_client_loader(k, batch=batch)
+            loader = client_loader[k]
+
+            clients_phi[k].train()
+            clients_kappa[k].train()
+            server_theta.train()
 
             for _ in range(LOCAL_EPOCHS):
                 for xb, yb in loader:
@@ -469,7 +516,6 @@ def train_split_training(in_channels, img_size, split_index,
                     out_c = clients_kappa[k](h)
                     out_s = server_theta(h)
                     loss = gamma * F.cross_entropy(out_c, yb) + (1.0 - gamma) * F.cross_entropy(out_s, yb)
-                    print("Loss:", loss.item())
                     opt.zero_grad()
                     loss.backward()
                     opt.step()
@@ -528,9 +574,99 @@ def train_split_training(in_channels, img_size, split_index,
     server_theta_state_cpu = {k: v.cpu().clone() for k, v in theta_state.items()}
     return clients_phi_states_cpu, clients_kappa_states_cpu, server_theta_state_cpu
 
-# -------------------------
-# Main experiment orchestration
-# -------------------------
+
+def train_personalized_local_only(in_channels, img_size, lr, batch, rounds, client_loader):
+    """
+    Trains K separate full VGG-11 models locally for 'rounds' epochs (full personalization).
+    No communication or aggregation takes place.
+    Returns: list of K full model state dicts (CPU).
+    """
+    # Initialize K independent full VGG models
+    clients_models = [
+        VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
+        for _ in range(K)
+    ]
+
+    # Initialize K independent optimizers
+    clients_opts = [optim.SGD(model.parameters(), lr=lr) for model in clients_models]
+
+    for r in tqdm(range(rounds), desc="Global rounds (Personalized Local)"):
+        for k in tqdm(range(K), desc=" Clients Number ", leave=False):
+            model = clients_models[k]
+            opt = clients_opts[k]
+            loader = client_loader[k]
+            model.train()
+
+            for _ in range(LOCAL_EPOCHS):
+                for xb, yb in loader:
+                    xb = xb.to(DEVICE)
+                    if not torch.is_tensor(yb):
+                        yb = torch.tensor(yb, dtype=torch.long)
+                    yb = yb.to(DEVICE)
+
+                    out = model(xb)
+                    loss = F.cross_entropy(out, yb)
+
+                    opt.zero_grad()
+                    loss.backward()
+                    opt.step()
+
+    # Return final states of all K personalized models
+    return [model.state_dict() for model in clients_models]
+
+
+def train_fedavg(in_channels, img_size, lr, batch, rounds, client_loader):
+    """
+    Trains a single global VGG-11 model using Federated Averaging (FedAvg).
+    Returns: a single global model state dict (CPU).
+    """
+    # 1. Initialize a single global model
+    global_model = VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
+    global_state = global_model.state_dict()
+
+    for r in tqdm(range(rounds), desc="Global rounds (FedAvg)"):
+        client_updates = []
+
+        for k in tqdm(range(K), desc=" Clients Number ", leave=False):
+            # 2. Local client training
+            local_model = deepcopy(global_model).to(DEVICE)
+            opt = optim.SGD(local_model.parameters(), lr=lr)
+            loader = client_loader[k]
+            local_model.train()
+
+            for _ in range(LOCAL_EPOCHS):
+                for xb, yb in loader:
+                    xb = xb.to(DEVICE)
+                    if not torch.is_tensor(yb):
+                        yb = torch.tensor(yb, dtype=torch.long)
+                    yb = yb.to(DEVICE)
+
+                    out = local_model(xb)
+                    loss = F.cross_entropy(out, yb)
+
+                    opt.zero_grad()
+                    loss.backward()
+                    opt.step()
+
+            # 3. Collect update weights (delta_weights)
+            # Since all data sizes are equal (2 shards per client), update aggregation is a simple average.
+            client_updates.append(local_model.state_dict())
+
+            del local_model, opt
+            torch.cuda.empty_cache()
+
+        # 4. Aggregation (FedAvg)
+        new_global_state = {}
+        for key in global_state.keys():
+            # Average the weights across all clients
+            s = sum(client_updates[i][key].to(torch.float32) for i in range(K))
+            new_global_state[key] = (s / K).clone()
+
+        global_model.load_state_dict(new_global_state)
+        global_state = new_global_state  # Update state for next round
+
+    # Return final global state
+    return global_state
 if __name__ == "__main__":
 
     args = parse_args()
@@ -562,23 +698,28 @@ if __name__ == "__main__":
     SMALL_CLASSIFIER = args.small_classifier
     PROBE_PRINTS = args.probe
     DATASET = args.dataset
+    ETH = args.eth # <--- GET ETH FROM ARGS
+    split_index = args.split_index
+    method = args.method
+    results_folder_name = "results"
+    os.makedirs(results_folder_name, exist_ok=True)
 
     p_values = [0.0 ,0.2,0.4,0.6,0.8,1.0]  # OOD fractions to evaluate
-    OUT_DIR = f"splitgp_vgg11_results_{DATASET}_rounds_{ROUNDS}"
+    OUT_DIR = f"{results_folder_name}/splitgp_vgg11_results_{DATASET}_method_{method}_rounds_{ROUNDS}_clients_{K}_model_split_index_{split_index}_gamma_{GAMMA}_lambda_split_{LAMBDA_SPLITGP}_ETH_{ETH}"
     os.makedirs(OUT_DIR, exist_ok=True)
 
 
     # ---- Run methods ----
     methods_to_run = [args.method] if args.method != "all" else ["splitgp", "fedavg", "personalized", "multi-exit"]
-
+    print("method to run: ", methods_to_run)
     trainset, testset, IN_CHANNELS, IMG_SIZE = get_datasets(DATASET)
     train_labels = np.array(trainset.targets)
     test_labels = np.array(testset.targets)
 
     clients_indices = create_clients_shards(trainset, K=K, shards=SHARDS)
     print(f"Created {K} clients; approx samples per client = {len(clients_indices[0])}")
-
-
+    # Build client loaders once, reuse for all methods
+    client_loaders = {i: get_client_loader(i, batch=BATCH) for i in range(K)}
 
     # Build per-client test sets for each p
     per_p_testsets = {}
@@ -592,7 +733,6 @@ if __name__ == "__main__":
     feat_children = list(tmp_base.features.children())
     # choose split roughly so phi has 4 conv layers as in paper; select index by inspection
     # safe choice: split_index = 10 (used earlier) - this works in our construction
-    split_index = 10
 
     # Optional: probe shapes
     phi_tmp = Phi(tmp_base, split_index=split_index)
@@ -602,86 +742,147 @@ if __name__ == "__main__":
 
     results = defaultdict(list)
 
-    multi_exit = False
-    split_gp = True
-    personalized = False
-    fedavg = False
-
-    if multi_exit:
+    if "multi-exit" in methods_to_run:
         # 1) Multi-Exit baseline (lambda=0 -> clients fully replaced by avg)
         print("Training Multi-Exit (split, lambda=0) ...")
         clients_phi_me, clients_kappa_me, server_theta_me = train_split_training(
-            in_channels=IN_CHANNELS, img_size=IMG_SIZE, split_index=split_index,
-            lambda_personalization=0.0, gamma=GAMMA, lr=LR, batch=BATCH, rounds=ROUNDS)
+                                                                            in_channels=IN_CHANNELS,
+                                                                            img_size=IMG_SIZE,
+                                                                            split_index=split_index,
+                                                                            lambda_personalization=0.0,
+                                                                            gamma=GAMMA,
+                                                                            lr=LR,
+                                                                            batch=BATCH,
+                                                                            rounds=ROUNDS,
+                                                                            client_loader=client_loaders
+                                                                            )
 
         for p in p_values:
-            full_acc, client_acc = evaluate_method_split(clients_phi_me, clients_kappa_me, server_theta_me,
-                                                         per_p_testsets[p], in_channels=IN_CHANNELS, img_size=IMG_SIZE,
-                                                         split_index=split_index, batch_size=BATCH)
-            results['Multi-Exit (lambda=0)'].append(full_acc)
-            print(f"p={p:.2f} Multi-Exit full acc: {full_acc:.4f}  client acc: {client_acc:.4f}")
+            full_acc, client_acc, selective_acc = evaluate_method_split(clients_phi_me,
+                                                         clients_kappa_me,
+                                                         server_theta_me,
+                                                         per_p_testsets[p],
+                                                         in_channels=IN_CHANNELS,
+                                                         img_size=IMG_SIZE,
+                                                         split_index=split_index,
+                                                         threshold=ETH,
+                                                         batch_size=BATCH)
+            results['Multi-Exit'].append(full_acc)
+            # results['Multi-Exit-Clien'].append(client_acc)
 
-        # Save intermediate
-        pd.DataFrame({'Multi-Exit (lambda=0)': results['Multi-Exit (lambda=0)']}, index=p_values).to_csv(os.path.join(OUT_DIR,'multi_exit.csv'))
+            print(f"p={p:.2f} Multi-Exit full acc: {full_acc:.4f}  client acc: {client_acc:.4f}, selective_acc : {selective_acc:.4f} ")
 
-    if split_gp:
+        df = pd.DataFrame(results, index=p_values)
+        df.index.name = 'p'
+        csv_path = os.path.join(OUT_DIR, "multi-exist.csv")
+        df.to_csv(csv_path)
+        print("Saved CSV ->", csv_path)
+
+    if "splitgp" in methods_to_run:
 
         # 2) SplitGP (lambda = LAMBDA_SPLITGP)
         print("Training SplitGP (lambda=%.2f) ..." % (LAMBDA_SPLITGP))
         clients_phi_sgp, clients_kappa_sgp, server_theta_sgp = train_split_training(
-            in_channels=IN_CHANNELS, img_size=IMG_SIZE, split_index=split_index,
-            lambda_personalization=LAMBDA_SPLITGP, gamma=GAMMA, lr=LR, batch=BATCH, rounds=ROUNDS)
+            in_channels=IN_CHANNELS,
+            img_size=IMG_SIZE,
+            split_index=split_index,
+            lambda_personalization=LAMBDA_SPLITGP,
+            gamma=GAMMA,
+            lr=LR,
+            batch=BATCH,
+            rounds=ROUNDS,
+            client_loader=client_loaders)
 
-        for p in p_values:
-            full_acc, client_acc = evaluate_method_split(clients_phi_sgp, clients_kappa_sgp, server_theta_sgp,
-                                                         per_p_testsets[p], in_channels=IN_CHANNELS, img_size=IMG_SIZE,
-                                                         split_index=split_index, batch_size=BATCH)
-            results['SplitGP (lambda=%.2f)' % LAMBDA_SPLITGP].append(full_acc)
-            print(f"p={p:.2f} SplitGP full acc: {full_acc:.4f}  client acc: {client_acc:.4f}")
-        # Combine and save
-        df = pd.DataFrame(results, index=p_values)
-        df.index.name = 'p'
-        csv_path = os.path.join(OUT_DIR, "splitgp_combined_results.csv")
-        df.to_csv(csv_path)
-        print("Saved CSV ->", csv_path)
+        # Sweep over multiple thresholds
+        thresholds = [0.05, 0.1, 0.2,0.4,0.8,1.2,1.6,2.3, 2.0]  # 👈 adjust this list as needed
 
-    if personalized:
+        for eth in thresholds:
+            print(f"\n>>> Evaluating SplitGP with Eth={eth:.2f}")
+            results = {"full_acc": [], "client_acc": [], "selective_acc": []}
 
+            for p in p_values:
+                full_acc, client_acc, selective_acc = evaluate_method_split(
+                    clients_phi_sgp,
+                    clients_kappa_sgp,
+                    server_theta_sgp,
+                    per_p_testsets[p],
+                    in_channels=IN_CHANNELS,
+                    img_size=IMG_SIZE,
+                    split_index=split_index,
+                    threshold=eth,  # 👈 use current Eth
+                    batch_size=BATCH)
+
+                # Record results
+                results['full_acc'].append(full_acc)
+                results["client_acc"].append(client_acc)
+                results["selective_acc"].append(selective_acc)
+
+                print(
+                    f"Eth={eth:.2f} | p={p:.2f} SplitGP full acc: {full_acc:.4f}  client acc: {client_acc:.4f} selective acc: {selective_acc:.4f}"
+                )
+
+            # Save CSV per threshold
+            df = pd.DataFrame(results, index=p_values)
+            df.index.name = 'p'
+            csv_name = f"splitgp_combined_results_eth_{eth:.2f}.csv"  # 👈 separate CSV per Eth
+            csv_path = os.path.join(OUT_DIR, csv_name)
+            df.to_csv(csv_path)
+            print("Saved CSV ->", csv_path)
+
+    if "personalized" in methods_to_run:
+        print("Personalized (local-only) training ...")
         # 3) Personalized local-only baseline (full models per client)
         print("Training Personalized (local-only) models ...")
-        personal_states = train_personalized_local_only(in_channels=IN_CHANNELS, img_size=IMG_SIZE, batch=BATCH, rounds=ROUNDS, lr=LR)
+        personal_states = train_personalized_local_only(in_channels=IN_CHANNELS,
+                                                       img_size=IMG_SIZE,
+                                                       batch=BATCH,
+                                                       rounds=ROUNDS,
+                                                       lr=LR,
+                                                       client_loader=client_loaders)
+        # Evaluate each client's unique full model
         for p in p_values:
-            avg_acc = evaluate_method_full_models(personal_states, per_p_testsets[p], in_channels=IN_CHANNELS, img_size=IMG_SIZE, batch_size=BATCH)
+            # Note: This uses the existing evaluation helper for K full models.
+            avg_acc = evaluate_method_full_models(personal_states, per_p_testsets[p], in_channels=IN_CHANNELS,
+                                                  img_size=IMG_SIZE, batch_size=BATCH)
             results['Personalized'].append(avg_acc)
             print(f"p={p:.2f} Personalized avg acc: {avg_acc:.4f}")
-        pd.DataFrame({'Personalized': results['Personalized']}, index=p_values).to_csv(os.path.join(OUT_DIR,'personalized.csv'))
+        pd.DataFrame({'Personalized': results['Personalized']}, index=p_values).to_csv(
+            os.path.join(OUT_DIR, 'personalized.csv'))
 
-    if fedavg:
+    if "fedavg" in methods_to_run:
+        print("Training FedAvg ...")
+        # 4) FedAvg global baseline (Generalized Global Model via FL)
+        print("Training FedAvg (Generalized Global) model ...")
+        global_state = train_fedavg(in_channels=IN_CHANNELS,
+                                    img_size=IMG_SIZE,
+                                    batch=BATCH,
+                                    rounds=ROUNDS,
+                                    lr=LR,
+                                    client_loader=client_loaders)
 
-        # 4) FedAvg global baseline
-        print("Training FedAvg global model ...")
-        fedavg_state = train_fedavg_global(in_channels=IN_CHANNELS, img_size=IMG_SIZE, batch=BATCH, rounds=ROUNDS, lr=LR)
-        # evaluate FedAvg as a single global model on each client testset (same model used for all clients)
-        fedavg_model = {k: v.cpu().clone() for k, v in fedavg_state.items()}  # CPU copies
-        fedavg_accs = []
+        # Prepare a list of K identical states for the evaluation helper
+        global_states_list = [global_state] * K
+
+        # Evaluate the single global model on all K test sets
         for p in p_values:
-            # evaluate with same model for all clients
-            # build a temporary list of per-client "global" state dicts (same copy repeated)
-            global_states = [fedavg_model for _ in range(K)]
-            avg_acc = evaluate_method_full_models(global_states, per_p_testsets[p], in_channels=IN_CHANNELS, img_size=IMG_SIZE, batch_size=BATCH)
-            fedavg_accs.append(avg_acc)
-            print(f"p={p:.2f} FedAvg avg acc: {avg_acc:.4f}")
-        results['Generalized-FedAvg'] = fedavg_accs
-        pd.DataFrame({'Generalized-FedAvg': fedavg_accs}, index=p_values).to_csv(os.path.join(OUT_DIR,'fedavg.csv'))
+            # Note: This uses the evaluation helper for K full models, but they are all identical.
+            avg_acc = evaluate_method_full_models(global_states_list, per_p_testsets[p], in_channels=IN_CHANNELS,
+                                                  img_size=IMG_SIZE, batch_size=BATCH)
+            results['FedAvg Global'].append(avg_acc)
+            print(f"p={p:.2f} FedAvg Global avg acc: {avg_acc:.4f}")
+
+        pd.DataFrame({'FedAvg Global': results['FedAvg Global']}, index=p_values).to_csv(
+            os.path.join(OUT_DIR, 'fedavg_global.csv'))
 
 
     # Plot
+    print("Plotting results ...")
     plt.figure(figsize=(8,6))
     for method, accs in results.items():
         plt.plot(p_values, accs, marker='o', label=method)
     plt.xlabel("p (relative portion of OOD samples)")
     plt.ylabel("Test accuracy")
-    plt.title("SplitGP / Baselines: Accuracy vs p")
+    plt.title(f"{method}: Accuracy vs p")
     plt.xticks(p_values)
     plt.grid(True)
     plt.legend()
