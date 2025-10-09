@@ -1,1 +1,3 @@
-# FL-JointPG--inference-stage-optimization-WirelessEdge
+# FL-JointPG--inference-stage-optimi## Description
+
+FL-JointPG--inference-stage-optimization-WirelessEdge is a Python project focused on federated learning and joint policy gradient optimization for inference stage optimization in wireless edge environments. The project aims to improve efficiency and performance in distributed edge computing scenarios using advanced machine learning techniques.zation-WirelessEdge
