@@ -1,4 +1,12 @@
-
+code/plots/*
+code/results/*
+code/*.png
+code/*.jpg
+code/*.jpeg
+code/*.csv
+*.zip
+*.html
+*.xml
 # Byte-compiled / optimized / DLL files
 .idea
 *.xml
@@ -16,7 +24,7 @@ __pycache__/
 .venv
 .ipynb_checkpoints
 .idea
-
+*.iml
 # C extensions
 *.so
 

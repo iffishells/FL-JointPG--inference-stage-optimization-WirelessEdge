@@ -146,7 +146,9 @@ class Kappa(nn.Module):
 
 # Helper to get feature shape of phi for MNIST input
 # Helper to get feature shape of phi for input
-def probe_phi_feature_shape(phi_module, in_channels=1, img_size=28):
+def probe_phi_feature_shape(phi_module,
+                            in_channels=1,
+                            img_size=28):
     with torch.no_grad():
         sample = torch.randn(1, in_channels, img_size, img_size).to(next(phi_module.parameters()).device)
         feat = phi_module(sample)
@@ -316,8 +318,10 @@ def train_split_training(lambda_personalization=0.2):
     """
 
     base = BaseCNN(in_channels=IN_CHANNELS, num_classes=10)
+    # store and intialize model on the device respectively
     phi_template = Phi(base).to(device)
     theta_template = Theta(base).to(device)
+
     feat_shape = probe_phi_feature_shape(Phi(base), in_channels=IN_CHANNELS, img_size=IMG_SIZE)
     # kappa template per client -> dimension = flattened phi output
     # initialize models
@@ -335,6 +339,7 @@ def train_split_training(lambda_personalization=0.2):
         client_phi_states = []
         client_kappa_states = []
         client_theta_states = []
+
         for k in tqdm(range(K),desc=" Clients train_split_training",leave=False):
             # load current states
             clients_phi[k].load_state_dict(phi_state)
@@ -342,12 +347,16 @@ def train_split_training(lambda_personalization=0.2):
             server_theta.load_state_dict(theta_state)
 
             # local optimizer over phi,kappa,theta (theta here is local replica used for computing server-side loss)
-            opt = optim.SGD(list(clients_phi[k].parameters()) + list(clients_kappa[k].parameters()) + list(
-                server_theta.parameters()), lr=LR)
+            opt = optim.SGD(list(clients_phi[k].parameters()) +
+                            list(clients_kappa[k].parameters()) +
+                            list(server_theta.parameters()),
+                            lr=LR)
+            
             loader = get_client_loader(k)
             clients_phi[k].train()
             clients_kappa[k].train()
             server_theta.train()
+
             for _ in tqdm(range(LOCAL_EPOCHS),desc=f"Client {k} local epochs", leave=False):
                 for xb, yb in loader:
                     xb, yb = xb.to(device), yb.to(device)
@@ -355,8 +364,8 @@ def train_split_training(lambda_personalization=0.2):
                     out_c = clients_kappa[k](h)
                     out_s = server_theta(h)
                     loss = GAMMA * F.cross_entropy(out_c, yb) + (1 - GAMMA) * F.cross_entropy(out_s, yb)
-                    opt.zero_grad();
-                    loss.backward();
+                    opt.zero_grad()
+                    loss.backward()
                     opt.step()
             client_phi_states.append(deepcopy(clients_phi[k].state_dict()))
             client_kappa_states.append(deepcopy(clients_kappa[k].state_dict()))
@@ -420,29 +429,29 @@ def run_all():
     results = defaultdict(list)
 
     # 1) Personalized FL (local only)
-    print("Training Personalized (local-only) FL...")
-    personal_models = train_personalized_local_only()
-    for p in tqdm(p_values,desc="Evaluating p values (Training Personalized (local-only) FL)"):
-        avg_acc = evaluate_method_full_models(personal_models, per_p_testsets[p])
-        results['Personalized'].append(avg_acc)
-        print(f"p={p:.2f} Personalized avg acc: {avg_acc:.4f}")
+    # print("Training Personalized (local-only) FL...")
+    # personal_models = train_personalized_local_only()
+    # for p in tqdm(p_values,desc="Evaluating p values (Training Personalized (local-only) FL)"):
+    #     avg_acc = evaluate_method_full_models(personal_models, per_p_testsets[p])
+    #     results['Personalized'].append(avg_acc)
+    #     print(f"p={p:.2f} Personalized avg acc: {avg_acc:.4f}")
 
     # # 2) Generalized FL (FedAvg)
-    print("Training FedAvg global model...")
-    global_model = train_fedavg_global()
-    for p in tqdm(p_values,desc="Evaluating p values(Training FedAvg global model..)"):
-        avg_acc = evaluate_method_full_models(global_model, per_p_testsets[p])
-        results['Generalized-FedAvg'].append(avg_acc)
-        print(f"p={p:.2f} FedAvg avg acc: {avg_acc:.4f}")
+    # print("Training FedAvg global model...")
+    # global_model = train_fedavg_global()
+    # for p in tqdm(p_values,desc="Evaluating p values(Training FedAvg global model..)"):
+    #     avg_acc = evaluate_method_full_models(global_model, per_p_testsets[p])
+    #     results['Generalized-FedAvg'].append(avg_acc)
+    #     print(f"p={p:.2f} FedAvg avg acc: {avg_acc:.4f}")
 
-    # # 3) Multi-Exit NN via split with lambda=0 (no personalization)
-    print("\n\nTraining Multi-Exit (split, lambda=0)...")
-    clients_phi_me, clients_kappa_me, server_theta_me = train_split_training(lambda_personalization=0.0)
-    for p in tqdm(p_values,desc="Evaluating p values (Training Multi-Exit (split, lambda=0)...)"):
-        full_acc, client_acc = evaluate_method_split(clients_phi_me, clients_kappa_me, server_theta_me, per_p_testsets[p])
-        # For fair global comparison, use full_acc (server-side predictions after offload)
-        results['Multi-Exit (lambda=0)'].append(full_acc)
-        print(f"p={p:.2f} Multi-Exit full avg acc: {full_acc:.4f} (client avg acc {client_acc:.4f})")
+    # # # 3) Multi-Exit NN via split with lambda=0 (no personalization)
+    # print("\n\nTraining Multi-Exit (split, lambda=0)...")
+    # clients_phi_me, clients_kappa_me, server_theta_me = train_split_training(lambda_personalization=0.0)
+    # for p in tqdm(p_values,desc="Evaluating p values (Training Multi-Exit (split, lambda=0)...)"):
+    #     full_acc, client_acc = evaluate_method_split(clients_phi_me, clients_kappa_me, server_theta_me, per_p_testsets[p])
+    #     # For fair global comparison, use full_acc (server-side predictions after offload)
+    #     results['Multi-Exit (lambda=0)'].append(full_acc)
+    #     print(f"p={p:.2f} Multi-Exit full avg acc: {full_acc:.4f} (client avg acc {client_acc:.4f})")
 
     # 4) SplitGP (lambda = 0.2)
 
