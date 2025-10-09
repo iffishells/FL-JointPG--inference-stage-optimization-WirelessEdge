@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="f94cf40d-a25c-455a-9906-7639eb1ed66e" name="FL-joint">
+        <fileTransfer accessType="SFTP" host="163.180.144.73" port="20002" sshConfigId="3026b098-0a63-4200-b4e5-d7e2945146b0" sshConfig="muhammad@163.180.144.73:20002 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>

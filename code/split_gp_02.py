@@ -24,7 +24,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from fontTools.misc.cython import returns
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
@@ -485,12 +484,12 @@ def train_split_training(in_channels, img_size, split_index,
     clients_phi_states_cpu = None
     clients_kappa_states_cpu = None
 
-    for r in tqdm(range(rounds), desc="Global rounds (split)"):
+    for r in tqdm(range(rounds), desc=f"Global rounds (split) : gamma : {gamma} , lambda : {lambda_personalization} , lr : {lr}"):
         client_phi_states = []
         client_kappa_states = []
         client_theta_states = []
 
-        for k in tqdm(range(K),desc=" Clients Number ", leave=False):
+        for k in tqdm(range(K),desc=f" Clients Number  : gamma : {gamma} , lambda : {lambda_personalization} , lr : {lr}", leave=False):
             # load broadcast to client (move to device)
             clients_phi[k].load_state_dict({kk: vv.to(DEVICE) for kk, vv in phi_state.items()})
             clients_kappa[k].load_state_dict({kk: vv.to(DEVICE) for kk, vv in kappa_state.items()})
@@ -708,6 +707,7 @@ if __name__ == "__main__":
     p_values = [0.0 ,0.2,0.4,0.6,0.8,1.0]  # OOD fractions to evaluate
     OUT_DIR = f"{results_folder_name}/splitgp_vgg11_results_{DATASET}_method_{method}_rounds_{ROUNDS}_clients_{K}_model_split_index_{split_index}_gamma_{GAMMA}_lambda_split_{LAMBDA_SPLITGP}_ETH_{ETH}"
 
+
     list_of_previous_experiments = os.listdir(OUT_DIR)
 
     if OUT_DIR in list_of_previous_experiments:
@@ -750,11 +750,7 @@ if __name__ == "__main__":
         print("Probe phi output feature shape (C,H,W):", feat_shape)
 
     results = defaultdict(list)
-    all_sweep_results = []
-    p_values = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
-    lambda_values = [0.0, 0.2]
-    gamma_values = [0.0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0]
-    eth_thresholds = [0.05, 0.1, 0.2, 0.8, 1.2, 1.6, 2.3, 2.5, 2.7, 2.8, 3.0]
+
     if "multi-exit" in methods_to_run:
         # 1) Multi-Exit baseline (lambda=0 -> clients fully replaced by avg)
         print("Training Multi-Exit (split, lambda=0) ...")
@@ -769,44 +765,33 @@ if __name__ == "__main__":
                                                                             rounds=ROUNDS,
                                                                             client_loader=client_loaders
                                                                             )
-        for eth in eth_thresholds:
-            multi_exit_current_result_set = {
-                "p": [],
-                "full_acc": [],
-                "client_acc": [],
-                "selective_acc": [],
-                "gamma": [],
-                "lambda": [],
-                "eth": [],
-            }
-            for p in p_values:
-                full_acc, client_acc, selective_acc = evaluate_method_split(clients_phi_me,
-                                                             clients_kappa_me,
-                                                             server_theta_me,
-                                                             per_p_testsets[p],
-                                                             in_channels=IN_CHANNELS,
-                                                             img_size=IMG_SIZE,
-                                                             split_index=split_index,
-                                                             threshold=eth,
-                                                             batch_size=BATCH)
-                multi_exit_current_result_set["p"].append(p)
-                multi_exit_current_result_set['full_acc'].append(full_acc)
-                multi_exit_current_result_set["client_acc"].append(client_acc)
-                multi_exit_current_result_set["selective_acc"].append(selective_acc)
-                multi_exit_current_result_set["gamma"].append(GAMMA)
-                multi_exit_current_result_set["lambda"].append(LAMBDA_SPLITGP)
-                multi_exit_current_result_set["eth"].append(eth)
 
-                print(f"p={p:.2f} Multi-Exit full acc: {full_acc:.4f}  client acc: {client_acc:.4f}, selective_acc : {selective_acc:.4f} ")
+        for p in p_values:
+            full_acc, client_acc, selective_acc = evaluate_method_split(clients_phi_me,
+                                                         clients_kappa_me,
+                                                         server_theta_me,
+                                                         per_p_testsets[p],
+                                                         in_channels=IN_CHANNELS,
+                                                         img_size=IMG_SIZE,
+                                                         split_index=split_index,
+                                                         threshold=ETH,
+                                                         batch_size=BATCH)
+            results['Multi-Exit'].append(full_acc)
+            # results['Multi-Exit-Clien'].append(client_acc)
 
-            df = pd.DataFrame(multi_exit_current_result_set, index=p_values)
-            df.index.name = 'p'
-            csv_name = f"{method}_combined_results_eth_{eth:.2f}_gamma_{GAMMA}_lambda_split_{LAMBDA_SPLITGP}.csv"  # 👈 separate CSV per Eth
-            csv_path = os.path.join(OUT_DIR, csv_name)
-            df.to_csv(csv_path)
-            print("Saved CSV ->", csv_path)
+            print(f"p={p:.2f} Multi-Exit full acc: {full_acc:.4f}  client acc: {client_acc:.4f}, selective_acc : {selective_acc:.4f} ")
 
+        df = pd.DataFrame(results, index=p_values)
+        df.index.name = 'p'
+        csv_path = os.path.join(OUT_DIR, "multi-exist.csv")
+        df.to_csv(csv_path)
+        print("Saved CSV ->", csv_path)
 
+    all_sweep_results = []
+    p_values = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    lambda_values = [0.3,0.9]
+    gamma_values = [0.0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0]
+    eth_thresholds = [0.05,0.1,0.2,0.8,1.2,1.6,2.3, 2.5, 2.7, 2.8, 3.0]
 
     # sudo testing
     # lambda_values = [ 0.5]
