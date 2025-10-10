@@ -1,19 +1,4 @@
-# run_splitgp_vgg11.py
-"""
-Simplified SplitGP reproduction using VGG-11 backbone (CIFAR-10 by default).
 
-- Implements:
-  * Personalized local-only (each client trains full model locally)
-  * FedAvg global (global full-model aggregated)
-  * Split training (SplitGP family) with phi (client), kappa (client auxiliary), theta (server)
-  * Multi-Exit baseline as SplitGP with lambda=0
-- Produces CSV and plot of accuracy vs p (relative OOD fraction).
-- Designed to be runnable on a single machine (GPU recommended).
-
-Notes:
-- This is simplified for clarity and speed. For a paper-scale run increase K, ROUNDS, and classifier sizes.
-- The VGG classifier size is reduced by default to avoid OOM in small GPUs; you can toggle SMALL_CLASSIFIER=False to use original big layers.
-"""
 import os
 import random
 from copy import deepcopy
@@ -43,28 +28,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print("Device:", DEVICE)
-
-#
-# # Experiment size (paper uses K=50, ROUNDS large)
-# K = 50                # number of clients (set 50 for paper)
-# SHARDS = 100          # number of shards (paper uses 100)
-# ROUNDS = 100           # global rounds (paper: 120 for MNIST, 800 for CIFAR in paper)
-# LOCAL_EPOCHS = 1      # epochs per round per client (paper uses 1)
-# BATCH = 50            # mini-batch as in paper
-# LR = 0.01             # learning rate in paper
-# GAMMA = 0.5           # loss weight between client-side (kappa) and server-side (theta)
-# LAMBDA_SPLITGP = 0.2  # personalization weight (paper uses 0.2)
 SEED = 42
-#
-# NUM_WORKERS = 4
-# PIN_MEMORY = True
-#
-# # quick dev flags
-# SMALL_CLASSIFIER = True   # reduce VGG classifier size to avoid OOM during dev
-# PROBE_PRINTS = False
-
-# p_values = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]  # OOD fractions to evaluate
-
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
