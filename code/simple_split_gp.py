@@ -1,3 +1,19 @@
+# run_splitgp_vgg11.py
+"""
+Simplified SplitGP reproduction using VGG-11 backbone (CIFAR-10 by default).
+
+- Implements:
+  * Personalized local-only (each client trains full model locally)
+  * FedAvg global (global full-model aggregated)
+  * Split training (SplitGP family) with phi (client), kappa (client auxiliary), theta (server)
+  * Multi-Exit baseline as SplitGP with lambda=0
+- Produces CSV and plot of accuracy vs p (relative OOD fraction).
+- Designed to be runnable on a single machine (GPU recommended).
+
+Notes:
+- This is simplified for clarity and speed. For a paper-scale run increase K, ROUNDS, and classifier sizes.
+- The VGG classifier size is reduced by default to avoid OOM in small GPUs; you can toggle SMALL_CLASSIFIER=False to use original big layers.
+"""
 import os
 import random
 from copy import deepcopy
@@ -8,6 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from fontTools.misc.cython import returns
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
@@ -15,11 +32,20 @@ import pandas as pd
 from tqdm import tqdm
 import argparse
 
+
+# -------------------------
+# Config (change as needed)
+# -------------------------
+
+
+
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print("Device:", DEVICE)
+
+
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
@@ -45,7 +71,7 @@ def parse_args():
 
     # Hardware
     parser.add_argument("--gpu", type=str, default="0", help="Which GPU id(s) to use (e.g. '0' or '0,1')")
-    parser.add_argument("--num-workers", type=int, default=4, help="Dataloader workers")
+    parser.add_argument("--num-workers", type=int, default=8, help="Dataloader workers")
     parser.add_argument("--no-pin-memory", action="store_true", help="Disable pin_memory in DataLoader")
     parser.add_argument("--eth", type=float, default=0.5, help="Entropy threshold (Eth) for selective offloading") # <--- ADD THIS LINE
 
@@ -97,79 +123,87 @@ def create_clients_shards(dataset, K=20, shards=100):
     labels = np.array(dataset.targets)
     sorted_idx = idxs[np.argsort(labels)]
     shard_size = n // shards
+    print(f"Shared size : {shard_size}")
     shard_idxs = [sorted_idx[i * shard_size:(i + 1) * shard_size] for i in range(shards)]
+    print(f"number of shareds : {len(shard_idxs)}")
     random.shuffle(shard_idxs)
     clients = {}
     for i in range(K):
         clients[i] = np.concatenate(shard_idxs[2 * i:2 * i + 2])
     return clients
 
-
-class SimpleCNN(nn.Module):
-    """CNN model for MNIST/FMNIST with 5 conv layers + 3 FC layers"""
-    def __init__(self, in_channels=1, num_classes=10):
+# -------------------------
+# VGG-11 (small classifier option)
+# -------------------------
+class VGG11_small(nn.Module):
+    """VGG-11 style network but with smaller FC layers (dev-friendly)."""
+    def __init__(self, in_channels=3, num_classes=10, small_classifier=True):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, 32, 3, 1, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, 3, 1, padding=1)
-        self.conv3 = nn.Conv2d(64, 128, 3, 1, padding=1)
-        self.conv4 = nn.Conv2d(128, 128, 3, 1, padding=1)
-        self.conv5 = nn.Conv2d(128, 256, 3, 1, padding=1)
-        self.pool = nn.MaxPool2d(2)
-        self.gap = nn.AdaptiveAvgPool2d((1,1))
-        self.fc1 = nn.Linear(256, 512)
-        self.fc2 = nn.Linear(512, 256)
-        self.fc3 = nn.Linear(256, num_classes)
+        # features (same conv stack)
+        self.features = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1), nn.ReLU(True),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(64, 128, kernel_size=3, padding=1), nn.ReLU(True),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(128, 256, kernel_size=3, padding=1), nn.ReLU(True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1), nn.ReLU(True),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(256, 512, kernel_size=3, padding=1), nn.ReLU(True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1), nn.ReLU(True),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(512, 512, kernel_size=3, padding=1), nn.ReLU(True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1), nn.ReLU(True),
+            nn.MaxPool2d(2, 2),
+        )
+        if small_classifier:
+            # smaller FCs: faster and less memory hungry
+            self.classifier = nn.Sequential(
+                nn.Linear(512, 512), nn.ReLU(True), nn.Dropout(),
+                nn.Linear(512, 256), nn.ReLU(True), nn.Dropout(),
+                nn.Linear(256, num_classes),
+            )
+        else:
+            # original large classifier (paper-like) - may be heavy
+            self.classifier = nn.Sequential(
+                nn.Linear(512, 4096), nn.ReLU(True), nn.Dropout(),
+                nn.Linear(4096, 4096), nn.ReLU(True), nn.Dropout(),
+                nn.Linear(4096, num_classes),
+            )
 
     def forward(self, x):
-        x = F.relu(self.conv1(x)); x = self.pool(x)
-        x = F.relu(self.conv2(x)); x = self.pool(x)
-        x = F.relu(self.conv3(x))
-        x = F.relu(self.conv4(x))
-        x = F.relu(self.conv5(x))
-        x = self.gap(x)
+        x = self.features(x)
         x = torch.flatten(x, 1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        return self.fc3(x)
-
-
-class Phi(nn.Module):
-    """Client-side feature extractor: first 4 conv layers of SimpleCNN (phi)."""
-    def __init__(self, cnn_model):
-        super().__init__()
-        # Client-side: conv1 -> conv4 (4 convolutional layers as per paper)
-        self.conv1 = cnn_model.conv1
-        self.conv2 = cnn_model.conv2
-        self.conv3 = cnn_model.conv3
-        self.conv4 = cnn_model.conv4
-        self.pool = cnn_model.pool
-
-    def forward(self, x):
-        x = F.relu(self.conv1(x)); x = self.pool(x)
-        x = F.relu(self.conv2(x)); x = self.pool(x)
-        x = F.relu(self.conv3(x))
-        x = F.relu(self.conv4(x))
+        x = self.classifier(x)
         return x
 
-class Theta(nn.Module):
-    """Server-side model: remaining conv layer + classifier (theta)."""
-    def __init__(self, cnn_model):
+# -------------------------
+# Split modules: Phi, Theta, Kappa
+# -------------------------
+class Phi(nn.Module):
+    """Client-side feature extractor: first N layers of vgg.features."""
+    def __init__(self, vgg_model, split_index):
         super().__init__()
-        # Server-side: conv5 + 3 FC layers
-        self.conv5 = cnn_model.conv5
-        self.gap = cnn_model.gap
-        self.fc1 = cnn_model.fc1
-        self.fc2 = cnn_model.fc2
-        self.fc3 = cnn_model.fc3
+        self.net = nn.Sequential(*list(vgg_model.features.children())[:split_index])
+
+    def forward(self, x):
+        return self.net(x)
+
+class Theta(nn.Module):
+    """Server-side model: remaining feature layers + classifier (flatten between)."""
+    def __init__(self, vgg_model, split_index):
+        super().__init__()
+        self.features_tail = nn.Sequential(*list(vgg_model.features.children())[split_index:])
+        self.classifier = nn.Sequential(*list(vgg_model.classifier.children()))
 
     def forward(self, h):
-        # h expected 4-D: (B,C,H,W) from phi
-        x = F.relu(self.conv5(h))
-        x = self.gap(x)
+        # h expected 4-D: (B,C,H,W)
+        x = self.features_tail(h)
         x = torch.flatten(x, 1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        return self.fc3(x)
+        return self.classifier(x)
 
 class Kappa(nn.Module):
     """Auxiliary classifier on top of phi features (flatten then linear)."""
@@ -181,6 +215,9 @@ class Kappa(nn.Module):
     def forward(self, h):
         return self.fc(torch.flatten(h, 1))
 
+# -------------------------
+# Utilities: data loaders, probe shapes, evaluation
+# -------------------------
 def probe_phi_feature_shape(phi_module, in_channels=3, img_size=32, device='cpu'):
     phi_module = phi_module.to(device)
     phi_module.eval()
@@ -202,8 +239,11 @@ def client_test_set_for_p(client_idx, p):
     classes = np.unique(np.array(trainset.targets)[train_idxs])
     main_mask = np.isin(test_labels, classes)
     main_idxs = np.where(main_mask)[0]
+
     n_main = len(main_idxs)
+
     n_ood = int(round(p * n_main))
+
     non_main_idxs = np.where(~main_mask)[0]
     if n_ood > 0:
         replace = n_ood > len(non_main_idxs)
@@ -219,9 +259,9 @@ def evaluate_method_full_models(clients_state_dicts, per_client_testsets, in_cha
     for k in range(K):
         state = clients_state_dicts[k]
         # rebuild full model
-        cnn = SimpleCNN(in_channels=in_channels, num_classes=10).to(DEVICE)
-        cnn.load_state_dict(state)
-        cnn.eval()
+        vgg = VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
+        vgg.load_state_dict(state)
+        vgg.eval()
         correct = 0
         total = 0
         loader = DataLoader(per_client_testsets[k], batch_size=batch_size, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
@@ -231,15 +271,77 @@ def evaluate_method_full_models(clients_state_dicts, per_client_testsets, in_cha
                 if not torch.is_tensor(yb):
                     yb = torch.tensor(yb, dtype=torch.long)
                 yb = yb.to(DEVICE)
-                out = cnn(xb)
+                out = vgg(xb)
                 pred = out.argmax(dim=1)
                 correct += (pred == yb).sum().item()
                 total += yb.size(0)
         accs.append(correct / total if total > 0 else 0.0)
-        del cnn
+        del vgg
         torch.cuda.empty_cache()
     return float(np.mean(accs))
 
+# def evaluate_method_split(clients_phi_states,
+#                           clients_kappa_states,
+#                           server_theta_state,
+#                           per_client_testsets,
+#                           in_channels,
+#                           img_size,
+#                           split_index,
+#                           batch_size=None):
+#     """
+#     Evaluate split model:
+#       - full model output computed by phi -> server_theta (server-side prediction)
+#       - client-side prediction phi -> kappa
+#     Return (avg_server_full_acc, avg_client_acc)
+#     """
+#     # rebuild server theta
+#     base = VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
+#     server_theta = Theta(base, split_index=split_index).to(DEVICE)
+#     server_theta.load_state_dict({k: v.to(DEVICE) for k, v in server_theta_state.items()})
+#     server_theta.eval()
+#
+#     full_accs = []
+#     client_accs = []
+#     for k in range(K):
+#         # rebuild phi & kappa
+#         base_local = VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
+#         phi = Phi(base_local, split_index=split_index).to(DEVICE)
+#         feat_shape = probe_phi_feature_shape(phi, in_channels=in_channels, img_size=img_size, device=DEVICE)
+#         kappa = Kappa(feat_shape, num_classes=10).to(DEVICE)
+#
+#         phi.load_state_dict({kk: vv.to(DEVICE) for kk, vv in clients_phi_states[k].items()})
+#         kappa.load_state_dict({kk: vv.to(DEVICE) for kk, vv in clients_kappa_states[k].items()})
+#         phi.eval(); kappa.eval()
+#
+#         correct_full = 0
+#         correct_client = 0
+#         total = 0
+#         threshold = 0.2
+#         loader = DataLoader(per_client_testsets[k], batch_size=batch_size, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+#         with torch.no_grad():
+#             for xb, yb in loader:
+#                 xb = xb.to(DEVICE)
+#                 if not torch.is_tensor(yb):
+#                     yb = torch.tensor(yb, dtype=torch.long)
+#                 yb = yb.to(DEVICE)
+#
+#                 h = phi(xb)
+#
+#
+#                 out_c = kappa(h).argmax(1)
+#                 out_s = server_theta(h).argmax(1)
+#                 correct_client += (out_c == yb).sum().item()
+#                 correct_full += (out_s == yb).sum().item()
+#                 total += yb.size(0)
+#         client_accs.append(correct_client / total if total > 0 else 0.0)
+#         full_accs.append(correct_full / total if total > 0 else 0.0)
+#
+#         del phi, kappa, base_local
+#         torch.cuda.empty_cache()
+#
+#     del server_theta
+#     torch.cuda.empty_cache()
+#     return float(np.mean(full_accs)), float(np.mean(client_accs))
 
 
 
@@ -260,8 +362,8 @@ def evaluate_method_split(clients_phi_states,
     Return (avg_server_full_acc, avg_client_acc, avg_selective_acc)
     """
     # rebuild server theta (same as before)
-    base = SimpleCNN(in_channels=in_channels, num_classes=10).to(DEVICE)
-    server_theta = Theta(base).to(DEVICE)
+    base = VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
+    server_theta = Theta(base, split_index=split_index).to(DEVICE)
     server_theta.load_state_dict({k: v.to(DEVICE) for k, v in server_theta_state.items()})
     server_theta.eval()
 
@@ -271,8 +373,8 @@ def evaluate_method_split(clients_phi_states,
 
     for k in range(K):
         # ... (rebuild phi & kappa - same as before)
-        base_local = SimpleCNN(in_channels=in_channels, num_classes=10).to(DEVICE)
-        phi = Phi(base_local).to(DEVICE)
+        base_local = VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
+        phi = Phi(base_local, split_index=split_index).to(DEVICE)
         feat_shape = probe_phi_feature_shape(phi, in_channels=in_channels, img_size=img_size, device=DEVICE)
         kappa = Kappa(feat_shape, num_classes=10).to(DEVICE)
 
@@ -351,9 +453,9 @@ def train_split_training(in_channels, img_size, split_index,
         raise ValueError("client_loaders must be provided (list or dict of DataLoaders indexed by client id)")
 
     # base model
-    base = SimpleCNN(in_channels=in_channels, num_classes=10).to(DEVICE)
-    phi_template = Phi(base).to(DEVICE)
-    theta_template = Theta(base).to(DEVICE)
+    base = VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
+    phi_template = Phi(base, split_index=split_index).to(DEVICE)
+    theta_template = Theta(base, split_index=split_index).to(DEVICE)
 
     feat_shape = probe_phi_feature_shape(phi_template, in_channels=in_channels, img_size=img_size, device=DEVICE)
     # prepare client copies
@@ -374,7 +476,8 @@ def train_split_training(in_channels, img_size, split_index,
         client_kappa_states = []
         client_theta_states = []
 
-        for k in tqdm(range(K),desc=" Clients Number ", leave=False):
+        for k in tqdm(range(K),desc=f" Clients training in rounds : {r}", leave=False):
+
             # load broadcast to client (move to device)
             clients_phi[k].load_state_dict({kk: vv.to(DEVICE) for kk, vv in phi_state.items()})
             clients_kappa[k].load_state_dict({kk: vv.to(DEVICE) for kk, vv in kappa_state.items()})
@@ -468,7 +571,7 @@ def train_personalized_local_only(in_channels, img_size, lr, batch, rounds, clie
     """
     # Initialize K independent full VGG models
     clients_models = [
-        SimpleCNN(in_channels=in_channels, num_classes=10).to(DEVICE)
+        VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
         for _ in range(K)
     ]
 
@@ -506,7 +609,7 @@ def train_fedavg(in_channels, img_size, lr, batch, rounds, client_loader):
     Returns: a single global model state dict (CPU).
     """
     # 1. Initialize a single global model
-    global_model = SimpleCNN(in_channels=in_channels, num_classes=10).to(DEVICE)
+    global_model = VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
     global_state = global_model.state_dict()
 
     for r in tqdm(range(rounds), desc="Global rounds (FedAvg)"):
@@ -580,7 +683,7 @@ if __name__ == "__main__":
     SEED = args.seed
     NUM_WORKERS = args.num_workers
     PIN_MEMORY = not args.no_pin_memory
-    SMALL_CLASSIFIER = False
+    SMALL_CLASSIFIER = args.small_classifier
     PROBE_PRINTS = args.probe
     DATASET = args.dataset
     ETH = args.eth # <--- GET ETH FROM ARGS
@@ -590,18 +693,19 @@ if __name__ == "__main__":
     os.makedirs(results_folder_name, exist_ok=True)
 
     p_values = [0.0 ,0.2,0.4,0.6,0.8,1.0]  # OOD fractions to evaluate
-    OUT_DIR = f"{results_folder_name}/splitgp_cnn_results_{DATASET}_method_{method}_rounds_{ROUNDS}_clients_{K}_gamma_{GAMMA}_lambda_split_{LAMBDA_SPLITGP}_ETH_{ETH}"
-    print("out dir",OUT_DIR)
+    OUT_DIR = f"{results_folder_name}/splitgp_vgg11_results_{DATASET}_method_{method}_rounds_{ROUNDS}_clients_{K}_model_split_index_{split_index}_gamma_{GAMMA}_lambda_split_{LAMBDA_SPLITGP}_ETH_{ETH}"
+    # Check if directory already exists
+    if os.path.exists(OUT_DIR):
+        list_of_previous_experiments = os.listdir(OUT_DIR)
+        if list_of_previous_experiments:  # If directory exists and is not empty
+            print(f"Experiment with name {OUT_DIR} already exists and contains files. Please choose a different name.")
+            exit(0)
+        else:
+            print(f"Experiment directory {OUT_DIR} exists but is empty. Will use it.")
+    else:
+        print(f"Experiment with name {OUT_DIR} will be created.")
+
     os.makedirs(OUT_DIR, exist_ok=True)
-
-    # list_of_previous_experiments = os.listdir(OUT_DIR)
-    #
-    # if OUT_DIR in list_of_previous_experiments:
-    #     print(f"Experiment with name {OUT_DIR} already exists. Please choose a different name.")
-    #     exit(0)
-    # else:
-    #     print(f"Experiment with name {OUT_DIR} will be created.")
-
 
     # ---- Run methods ----
     methods_to_run = [args.method] if args.method != "all" else ["splitgp", "fedavg", "personalized", "multi-exit"]
@@ -620,21 +724,27 @@ if __name__ == "__main__":
     for p in p_values:
         per_p_testsets[p] = [client_test_set_for_p(k, p) for k in range(K)]
 
-    # CNN model doesn't need split_index like VGG11 - phi is fixed to first 4 conv layers
-    tmp_base = SimpleCNN(in_channels=IN_CHANNELS, num_classes=10)
+    # choose a split index for VGG features (must be consistent)
+    # We pick split_index so phi contains first 6 conv/ReLU/pool blocks (tune if needed)
+    # Using the features list length: VGG11_small.features children length -> we'll print probe
+    tmp_base = VGG11_small(in_channels=IN_CHANNELS, num_classes=10, small_classifier=SMALL_CLASSIFIER)
+    feat_children = list(tmp_base.features.children())
+    print("Features children length:", len(feat_children))
+    # choose split roughly so phi has 4 conv layers as in paper; select index by inspection
+    # safe choice: split_index = 10 (used earlier) - this works in our construction
 
     # Optional: probe shapes
-    phi_tmp = Phi(tmp_base)
+    phi_tmp = Phi(tmp_base, split_index=split_index)
     feat_shape = probe_phi_feature_shape(phi_tmp, in_channels=IN_CHANNELS, img_size=IMG_SIZE, device=DEVICE)
     if PROBE_PRINTS:
         print("Probe phi output feature shape (C,H,W):", feat_shape)
-        print("CNN Architecture:")
-        print("  - Phi (client-side): 4 convolutional layers")
-        print("  - Theta (server-side): 1 convolutional layer + 3 FC layers")
-        print("  - Kappa (auxiliary): 1 FC layer")
 
     results = defaultdict(list)
-
+    all_sweep_results = []
+    p_values = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    lambda_values = [0.0, 0.2]
+    gamma_values = [0.0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0]
+    eth_thresholds = [0.05, 0.1, 0.2, 0.8, 1.2, 1.6, 2.3, 2.5, 2.7, 2.8, 3.0]
     if "multi-exit" in methods_to_run:
         # 1) Multi-Exit baseline (lambda=0 -> clients fully replaced by avg)
         print("Training Multi-Exit (split, lambda=0) ...")
@@ -649,33 +759,44 @@ if __name__ == "__main__":
                                                                             rounds=ROUNDS,
                                                                             client_loader=client_loaders
                                                                             )
+        for eth in eth_thresholds:
+            multi_exit_current_result_set = {
+                "p": [],
+                "full_acc": [],
+                "client_acc": [],
+                "selective_acc": [],
+                "gamma": [],
+                "lambda": [],
+                "eth": [],
+            }
+            for p in p_values:
+                full_acc, client_acc, selective_acc = evaluate_method_split(clients_phi_me,
+                                                             clients_kappa_me,
+                                                             server_theta_me,
+                                                             per_p_testsets[p],
+                                                             in_channels=IN_CHANNELS,
+                                                             img_size=IMG_SIZE,
+                                                             split_index=split_index,
+                                                             threshold=eth,
+                                                             batch_size=BATCH)
+                multi_exit_current_result_set["p"].append(p)
+                multi_exit_current_result_set['full_acc'].append(full_acc)
+                multi_exit_current_result_set["client_acc"].append(client_acc)
+                multi_exit_current_result_set["selective_acc"].append(selective_acc)
+                multi_exit_current_result_set["gamma"].append(GAMMA)
+                multi_exit_current_result_set["lambda"].append(LAMBDA_SPLITGP)
+                multi_exit_current_result_set["eth"].append(eth)
 
-        for p in p_values:
-            full_acc, client_acc, selective_acc = evaluate_method_split(clients_phi_me,
-                                                         clients_kappa_me,
-                                                         server_theta_me,
-                                                         per_p_testsets[p],
-                                                         in_channels=IN_CHANNELS,
-                                                         img_size=IMG_SIZE,
-                                                         split_index=split_index,
-                                                         threshold=ETH,
-                                                         batch_size=BATCH)
-            results['Multi-Exit'].append(full_acc)
-            # results['Multi-Exit-Clien'].append(client_acc)
+                print(f"p={p:.2f} Multi-Exit full acc: {full_acc:.4f}  client acc: {client_acc:.4f}, selective_acc : {selective_acc:.4f} ")
 
-            print(f"p={p:.2f} Multi-Exit full acc: {full_acc:.4f}  client acc: {client_acc:.4f}, selective_acc : {selective_acc:.4f} ")
+            df = pd.DataFrame(multi_exit_current_result_set, index=p_values)
+            df.index.name = 'p'
+            csv_name = f"{method}_combined_results_eth_{eth:.2f}_gamma_{GAMMA}_lambda_split_{LAMBDA_SPLITGP}.csv"  # 👈 separate CSV per Eth
+            csv_path = os.path.join(OUT_DIR, csv_name)
+            df.to_csv(csv_path)
+            print("Saved CSV ->", csv_path)
 
-        df = pd.DataFrame(results, index=p_values)
-        df.index.name = 'p'
-        csv_path = os.path.join(OUT_DIR, "multi-exist.csv")
-        df.to_csv(csv_path)
-        print("Saved CSV ->", csv_path)
 
-    all_sweep_results = []
-    p_values = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
-    lambda_values = [0.5, 0.8, 1.0]
-    gamma_values = [0.0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0]
-    eth_thresholds = [0.05,0.1,0.2,0.8,1.2,1.6,2.3, 2.5, 2.7, 2.8, 3.0]
 
     # sudo testing
     # lambda_values = [ 0.5]
@@ -683,13 +804,7 @@ if __name__ == "__main__":
     # eth_thresholds = [2.5]
     if "splitgp" in methods_to_run:
 
-        # 2) SplitGP (lambda = LAMBDA_SPLITGP)
-        print("Training SplitGP (lambda=%.2f) ..." % (LAMBDA_SPLITGP))
-        # for LAMBDA_SPLITGP in lambda_values:
-        #
-        #     # Outer loop: Sweep Gamma (Training Hyperparameter)
-        #     for GAMMA in gamma_values :
-        #         print(f"\n--- Training with GAMMA={GAMMA:.2f} and lambda : {LAMBDA_SPLITGP:.2f} ---")
+        print("Training SplitGP ...")
 
         # 1. Train the model for this specific GAMMA value
         clients_phi_sgp, clients_kappa_sgp, server_theta_sgp = train_split_training(
@@ -704,7 +819,7 @@ if __name__ == "__main__":
             client_loader=client_loaders)
 
         # Inner loop: Sweep Eth (Inference Hyperparameter)
-
+        print(f"eth_thresholds : {eth_thresholds}")
         for eth in eth_thresholds:
             print(f"\n>>> Evaluating SplitGP (G={GAMMA:.2f}) with Eth={eth:.2f}")
 
@@ -757,16 +872,16 @@ if __name__ == "__main__":
             # Append this DataFrame's data to the overall list
             all_sweep_results.append(df_temp)
 
-        # 3. Combine all results and save a single, comprehensive CSV
-        if all_sweep_results:
-            # Concatenate all DataFrames into one large table
-            df_final = pd.concat(all_sweep_results, ignore_index=True)
-            csv_name = "splitgp_gamma_eth_sweep_combined.csv"
-            csv_path = os.path.join(OUT_DIR, csv_name)
-            df_final.to_csv(csv_path, index=False)
-            print("\n========================================================")
-            print(f"✅ SUCCESSFULLY SAVED FINAL SWEEP RESULTS to -> {csv_path}")
-            print("========================================================")
+        # # 3. Combine all results and save a single, comprehensive CSV
+        # if all_sweep_results:
+        #     # Concatenate all DataFrames into one large table
+        #     df_final = pd.concat(all_sweep_results, ignore_index=True)
+        #     csv_name = "splitgp_gamma_eth_sweep_combined.csv"
+        #     csv_path = os.path.join(OUT_DIR, csv_name)
+        #     df_final.to_csv(csv_path, index=False)
+        #     print("\n========================================================")
+        #     print(f"✅ SUCCESSFULLY SAVED FINAL SWEEP RESULTS to -> {csv_path}")
+        #     print("========================================================")
 
     if "personalized" in methods_to_run:
         print("Personalized (local-only) training ...")
@@ -828,5 +943,4 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.savefig(os.path.join(OUT_DIR, "accuracy_vs_p.png"), dpi=300)
     plt.savefig(os.path.join(OUT_DIR, "accuracy_vs_p.pdf"))
-    print("Saved plot ->", os.path.join(OUT_DIR, "accuracy_vs_p.png"))
     plt.show()

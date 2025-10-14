@@ -1,3 +1,6 @@
 matplotlib
 tqdm
 pandas
+torch
+torchvision
+gpustat

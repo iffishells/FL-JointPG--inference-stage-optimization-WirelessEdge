@@ -1,4 +1,19 @@
+# run_splitgp_vgg11.py
+"""
+Simplified SplitGP reproduction using VGG-11 backbone (CIFAR-10 by default).
 
+- Implements:
+  * Personalized local-only (each client trains full model locally)
+  * FedAvg global (global full-model aggregated)
+  * Split training (SplitGP family) with phi (client), kappa (client auxiliary), theta (server)
+  * Multi-Exit baseline as SplitGP with lambda=0
+- Produces CSV and plot of accuracy vs p (relative OOD fraction).
+- Designed to be runnable on a single machine (GPU recommended).
+
+Notes:
+- This is simplified for clarity and speed. For a paper-scale run increase K, ROUNDS, and classifier sizes.
+- The VGG classifier size is reduced by default to avoid OOM in small GPUs; you can toggle SMALL_CLASSIFIER=False to use original big layers.
+"""
 import os
 import random
 from copy import deepcopy
@@ -30,8 +45,8 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print("Device:", DEVICE)
 
-SEED = 42
 
+SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -56,7 +71,7 @@ def parse_args():
 
     # Hardware
     parser.add_argument("--gpu", type=str, default="0", help="Which GPU id(s) to use (e.g. '0' or '0,1')")
-    parser.add_argument("--num-workers", type=int, default=4, help="Dataloader workers")
+    parser.add_argument("--num-workers", type=int, default=8, help="Dataloader workers")
     parser.add_argument("--no-pin-memory", action="store_true", help="Disable pin_memory in DataLoader")
     parser.add_argument("--eth", type=float, default=0.5, help="Entropy threshold (Eth) for selective offloading") # <--- ADD THIS LINE
 
@@ -108,7 +123,9 @@ def create_clients_shards(dataset, K=20, shards=100):
     labels = np.array(dataset.targets)
     sorted_idx = idxs[np.argsort(labels)]
     shard_size = n // shards
+    print(f"Shared size : {shard_size}")
     shard_idxs = [sorted_idx[i * shard_size:(i + 1) * shard_size] for i in range(shards)]
+    print(f"number of shareds : {len(shard_idxs)}")
     random.shuffle(shard_idxs)
     clients = {}
     for i in range(K):
@@ -222,8 +239,13 @@ def client_test_set_for_p(client_idx, p):
     classes = np.unique(np.array(trainset.targets)[train_idxs])
     main_mask = np.isin(test_labels, classes)
     main_idxs = np.where(main_mask)[0]
+
     n_main = len(main_idxs)
+    print(f"client {client_idx} has {n_main} main classes")
+
     n_ood = int(round(p * n_main))
+    print(f"client {client_idx} will have {n_ood} OOD samples")
+
     non_main_idxs = np.where(~main_mask)[0]
     if n_ood > 0:
         replace = n_ood > len(non_main_idxs)
@@ -260,68 +282,68 @@ def evaluate_method_full_models(clients_state_dicts, per_client_testsets, in_cha
         torch.cuda.empty_cache()
     return float(np.mean(accs))
 
-def evaluate_method_split(clients_phi_states,
-                          clients_kappa_states,
-                          server_theta_state,
-                          per_client_testsets,
-                          in_channels,
-                          img_size,
-                          split_index,
-                          batch_size=None):
-    """
-    Evaluate split model:
-      - full model output computed by phi -> server_theta (server-side prediction)
-      - client-side prediction phi -> kappa
-    Return (avg_server_full_acc, avg_client_acc)
-    """
-    # rebuild server theta
-    base = VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
-    server_theta = Theta(base, split_index=split_index).to(DEVICE)
-    server_theta.load_state_dict({k: v.to(DEVICE) for k, v in server_theta_state.items()})
-    server_theta.eval()
-
-    full_accs = []
-    client_accs = []
-    for k in range(K):
-        # rebuild phi & kappa
-        base_local = VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
-        phi = Phi(base_local, split_index=split_index).to(DEVICE)
-        feat_shape = probe_phi_feature_shape(phi, in_channels=in_channels, img_size=img_size, device=DEVICE)
-        kappa = Kappa(feat_shape, num_classes=10).to(DEVICE)
-
-        phi.load_state_dict({kk: vv.to(DEVICE) for kk, vv in clients_phi_states[k].items()})
-        kappa.load_state_dict({kk: vv.to(DEVICE) for kk, vv in clients_kappa_states[k].items()})
-        phi.eval(); kappa.eval()
-
-        correct_full = 0
-        correct_client = 0
-        total = 0
-        threshold = 0.2
-        loader = DataLoader(per_client_testsets[k], batch_size=batch_size, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
-        with torch.no_grad():
-            for xb, yb in loader:
-                xb = xb.to(DEVICE)
-                if not torch.is_tensor(yb):
-                    yb = torch.tensor(yb, dtype=torch.long)
-                yb = yb.to(DEVICE)
-
-                h = phi(xb)
-
-
-                out_c = kappa(h).argmax(1)
-                out_s = server_theta(h).argmax(1)
-                correct_client += (out_c == yb).sum().item()
-                correct_full += (out_s == yb).sum().item()
-                total += yb.size(0)
-        client_accs.append(correct_client / total if total > 0 else 0.0)
-        full_accs.append(correct_full / total if total > 0 else 0.0)
-
-        del phi, kappa, base_local
-        torch.cuda.empty_cache()
-
-    del server_theta
-    torch.cuda.empty_cache()
-    return float(np.mean(full_accs)), float(np.mean(client_accs))
+# def evaluate_method_split(clients_phi_states,
+#                           clients_kappa_states,
+#                           server_theta_state,
+#                           per_client_testsets,
+#                           in_channels,
+#                           img_size,
+#                           split_index,
+#                           batch_size=None):
+#     """
+#     Evaluate split model:
+#       - full model output computed by phi -> server_theta (server-side prediction)
+#       - client-side prediction phi -> kappa
+#     Return (avg_server_full_acc, avg_client_acc)
+#     """
+#     # rebuild server theta
+#     base = VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
+#     server_theta = Theta(base, split_index=split_index).to(DEVICE)
+#     server_theta.load_state_dict({k: v.to(DEVICE) for k, v in server_theta_state.items()})
+#     server_theta.eval()
+#
+#     full_accs = []
+#     client_accs = []
+#     for k in range(K):
+#         # rebuild phi & kappa
+#         base_local = VGG11_small(in_channels=in_channels, num_classes=10, small_classifier=SMALL_CLASSIFIER).to(DEVICE)
+#         phi = Phi(base_local, split_index=split_index).to(DEVICE)
+#         feat_shape = probe_phi_feature_shape(phi, in_channels=in_channels, img_size=img_size, device=DEVICE)
+#         kappa = Kappa(feat_shape, num_classes=10).to(DEVICE)
+#
+#         phi.load_state_dict({kk: vv.to(DEVICE) for kk, vv in clients_phi_states[k].items()})
+#         kappa.load_state_dict({kk: vv.to(DEVICE) for kk, vv in clients_kappa_states[k].items()})
+#         phi.eval(); kappa.eval()
+#
+#         correct_full = 0
+#         correct_client = 0
+#         total = 0
+#         threshold = 0.2
+#         loader = DataLoader(per_client_testsets[k], batch_size=batch_size, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+#         with torch.no_grad():
+#             for xb, yb in loader:
+#                 xb = xb.to(DEVICE)
+#                 if not torch.is_tensor(yb):
+#                     yb = torch.tensor(yb, dtype=torch.long)
+#                 yb = yb.to(DEVICE)
+#
+#                 h = phi(xb)
+#
+#
+#                 out_c = kappa(h).argmax(1)
+#                 out_s = server_theta(h).argmax(1)
+#                 correct_client += (out_c == yb).sum().item()
+#                 correct_full += (out_s == yb).sum().item()
+#                 total += yb.size(0)
+#         client_accs.append(correct_client / total if total > 0 else 0.0)
+#         full_accs.append(correct_full / total if total > 0 else 0.0)
+#
+#         del phi, kappa, base_local
+#         torch.cuda.empty_cache()
+#
+#     del server_theta
+#     torch.cuda.empty_cache()
+#     return float(np.mean(full_accs)), float(np.mean(client_accs))
 
 
 
@@ -456,7 +478,8 @@ def train_split_training(in_channels, img_size, split_index,
         client_kappa_states = []
         client_theta_states = []
 
-        for k in tqdm(range(K),desc=" Clients Number ", leave=False):
+        for k in tqdm(range(K),desc=f" Clients training in rounds : {r}", leave=False):
+
             # load broadcast to client (move to device)
             clients_phi[k].load_state_dict({kk: vv.to(DEVICE) for kk, vv in phi_state.items()})
             clients_kappa[k].load_state_dict({kk: vv.to(DEVICE) for kk, vv in kappa_state.items()})
@@ -673,7 +696,7 @@ if __name__ == "__main__":
 
     p_values = [0.0 ,0.2,0.4,0.6,0.8,1.0]  # OOD fractions to evaluate
     OUT_DIR = f"{results_folder_name}/splitgp_vgg11_results_{DATASET}_method_{method}_rounds_{ROUNDS}_clients_{K}_model_split_index_{split_index}_gamma_{GAMMA}_lambda_split_{LAMBDA_SPLITGP}_ETH_{ETH}"
-
+    print("Out dir",OUT_DIR)
     list_of_previous_experiments = os.listdir(OUT_DIR)
 
     if OUT_DIR in list_of_previous_experiments:
@@ -706,6 +729,7 @@ if __name__ == "__main__":
     # Using the features list length: VGG11_small.features children length -> we'll print probe
     tmp_base = VGG11_small(in_channels=IN_CHANNELS, num_classes=10, small_classifier=SMALL_CLASSIFIER)
     feat_children = list(tmp_base.features.children())
+    print("Features children length:", len(feat_children))
     # choose split roughly so phi has 4 conv layers as in paper; select index by inspection
     # safe choice: split_index = 10 (used earlier) - this works in our construction
 

@@ -330,14 +330,64 @@ def evaluate_method_full_models(clients_state_dicts, per_client_testsets,batch_s
         del model
         torch.cuda.empty_cache()
     return float(np.mean(accs))
+# ----------------------------
+# Energy estimation and Eth logic
+# ----------------------------
+def estimate_energy(x):
+    """Dummy energy estimation for local inference. Replace with real model if available."""
+    # For demonstration, use input size as proxy for energy
+    return x.numel() * 1e-6  # scale factor for illustration
+
+def evaluate_phi_kappa_with_eth(phi_states, kappa_states, per_client_testsets, batch_size, Eth):
+    """
+    Evaluate phi+kappa for each client, using Eth to decide local prediction or server offload.
+    Returns: avg local accuracy, portion of samples predicted locally.
+    """
+    local_accs = []
+    local_counts = []
+    total_counts = []
+    for k in range(K):
+        base = SimpleCNN(in_channels=IN_CHANNELS).to(device)
+        phi = Phi(base).to(device)
+        feat_shape = probe_phi_feature_shape(Phi(base), in_channels=IN_CHANNELS, img_size=IMG_SIZE, device=device)
+        kappa = Kappa(feat_shape).to(device)
+        phi.load_state_dict(phi_states[k])
+        kappa.load_state_dict(kappa_states[k])
+        phi.eval(); kappa.eval()
+        correct_local = 0
+        total_local = 0
+        total_samples = 0
+        loader = DataLoader(per_client_testsets[k], batch_size=batch_size, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+        with torch.no_grad():
+            for xb, yb in loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+                energy = estimate_energy(xb)
+                total_samples += yb.size(0)
+                if energy < Eth:
+                    h = phi(xb)
+                    out = kappa(h)
+                    pred = out.argmax(dim=1)
+                    correct_local += (pred == yb).sum().item()
+                    total_local += yb.size(0)
+                # else: offload to server (not implemented, so skip)
+        local_accs.append(correct_local / total_local if total_local > 0 else 0.0)
+        local_counts.append(total_local)
+        total_counts.append(total_samples)
+        del phi, kappa
+        torch.cuda.empty_cache()
+    avg_local_acc = float(np.mean(local_accs))
+    avg_local_portion = float(np.sum(local_counts)) / float(np.sum(total_counts)) if np.sum(total_counts) > 0 else 0.0
+    return avg_local_acc, avg_local_portion
+
 if __name__=='__main__':
     # ----------------------------
     # Config (change these)
     # ----------------------------
     DATASET = "CIFAR10"  # options: "MNIST", "FMNIST", "CIFAR10"
-    K =50  # number of clients (paper uses 50)
+    K =2  # number of clients (paper uses 50)
     SHARDS = 100  # number of shards (paper uses 100)
-    ROUNDS =800  # global rounds (paper: 120 for MNIST; increase for better accuracy)
+    ROUNDS =1  # global rounds (paper: 120 for MNIST; increase for better accuracy)
     LOCAL_EPOCHS = 1
     BATCH = 50
     LR = 0.01
@@ -348,7 +398,7 @@ if __name__=='__main__':
 
     # p values to evaluate (relative portion of OOD vs main)
     p_values = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
-
+    print(f"Configration : Rounds : {ROUNDS}")
     # output files
     OUT_DIR = f"Phi+Kappa_(local-only)_{DATASET}"
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -409,4 +459,26 @@ if __name__=='__main__':
     plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(OUT_DIR, "phi_kappa_accuracy_vs_p.png"), dpi=200)
+    plt.show()
+
+    Eth_values = [0.01, 0.02, 0.05, 0.1, 0.2]  # Example Eth thresholds
+    eth_results = {'Eth': [], 'Local Accuracy': [], 'Local Portion': []}
+    for Eth in Eth_values:
+        avg_acc, avg_portion = evaluate_phi_kappa_with_eth(phi_states, kappa_states, per_p_testsets[0.0], batch_size=BATCH, Eth=Eth)
+        print(f"Eth={Eth:.3f}: Local acc={avg_acc:.4f}, Local portion={avg_portion:.2f}")
+        eth_results['Eth'].append(Eth)
+        eth_results['Local Accuracy'].append(avg_acc)
+        eth_results['Local Portion'].append(avg_portion)
+    df_eth = pd.DataFrame(eth_results)
+    df_eth.to_csv(os.path.join(OUT_DIR, 'phi_kappa_eth_results.csv'))
+    plt.figure(figsize=(6,4))
+    plt.plot(df_eth['Eth'], df_eth['Local Accuracy'], marker='o', label='Local Accuracy')
+    plt.plot(df_eth['Eth'], df_eth['Local Portion'], marker='x', label='Local Portion')
+    plt.xlabel('Eth (Energy Threshold)')
+    plt.ylabel('Value')
+    plt.title('Effect of Eth on Local Accuracy and Portion')
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUT_DIR, 'phi_kappa_eth_plot.png'), dpi=200)
     plt.show()
