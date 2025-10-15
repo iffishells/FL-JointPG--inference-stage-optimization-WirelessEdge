@@ -214,15 +214,15 @@ def client_test_set_for_p(client_idx, p):
         final_idxs = main_idxs
     return Subset(testset, final_idxs)
 
-def evaluate_method_full_models(clients_state_dicts, per_client_testsets, in_channels, img_size, batch_size=None):
-    """clients_state_dicts: list of CPU state_dicts for full models"""
+def evaluate_method_full_models(clients_state_dicts, per_client_testsets, in_channels, img_size, batch_size=None, model_type='SimpleCNN', split_index=22):
+    """Evaluate K full models (one per client) for baselines like Personalized and FedAvg.
+    Uses the selected model_type (SimpleCNN or VGG11)."""
     accs = []
     for k in range(K):
         state = clients_state_dicts[k]
-        # rebuild full model
-        cnn = SimpleCNN(in_channels=in_channels, num_classes=10).to(DEVICE)
-        cnn.load_state_dict(state)
-        cnn.eval()
+        model = create_model(model_type, in_channels=in_channels, num_classes=10, split_index=split_index).to(DEVICE)
+        model.load_state_dict(state)
+        model.eval()
         correct = 0
         total = 0
         loader = DataLoader(per_client_testsets[k], batch_size=batch_size, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
@@ -232,19 +232,12 @@ def evaluate_method_full_models(clients_state_dicts, per_client_testsets, in_cha
                 if not torch.is_tensor(yb):
                     yb = torch.tensor(yb, dtype=torch.long)
                 yb = yb.to(DEVICE)
-                out = cnn(xb)
+                out = model(xb)
                 pred = out.argmax(dim=1)
-
-                # Fix for correct += (pred == yb).sum().item()
-                if not torch.is_tensor(pred):
-                    pred = torch.tensor(pred)
-                if not torch.is_tensor(yb):
-                    yb = torch.tensor(yb)
                 correct += (pred == yb).sum().item()
-
                 total += yb.size(0)
         accs.append(correct / total if total > 0 else 0.0)
-        del cnn
+        del model
         torch.cuda.empty_cache()
     return float(np.mean(accs))
 
@@ -259,93 +252,62 @@ def evaluate_method_split(clients_phi_states,
                           in_channels,
                           img_size,
                           split_index,
-                          threshold,  # <--- NEW ARGUMENT (Eth)
-                          batch_size=None):
+                          threshold,
+                          batch_size=None,
+                          model_type='SimpleCNN'):
     """
     Evaluate split model:
-      - full model output computed by phi -> server_theta (server-side prediction)
-      - client-side prediction phi -> kappa
+      - server-side prediction: phi -> theta
+      - client-side prediction: phi -> kappa
     Return (avg_server_full_acc, avg_client_acc, avg_selective_acc)
     """
-    # rebuild server theta (same as before)
-    base = SimpleCNN(in_channels=in_channels, num_classes=10).to(DEVICE)
-    server_theta = Theta(base).to(DEVICE)
+    base = create_model(model_type, in_channels=in_channels, num_classes=10, split_index=split_index).to(DEVICE)
+    server_theta = create_theta(base, model_type, split_index=split_index).to(DEVICE)
     server_theta.load_state_dict({k: v.to(DEVICE) for k, v in server_theta_state.items()})
     server_theta.eval()
 
-    full_accs = []
-    client_accs = []
-    selective_accs = []  # <--- MODIFIED TO INCLUDE SELECTIVE
+    full_accs, client_accs, selective_accs = [], [], []
 
     for k in range(K):
-        # ... (rebuild phi & kappa - same as before)
-        base_local = SimpleCNN(in_channels=in_channels, num_classes=10).to(DEVICE)
-        phi = Phi(base_local).to(DEVICE)
+        base_local = create_model(model_type, in_channels=in_channels, num_classes=10, split_index=split_index).to(DEVICE)
+        phi = create_phi(base_local, model_type, split_index=split_index).to(DEVICE)
         feat_shape = probe_phi_feature_shape(phi, in_channels=in_channels, img_size=img_size, device=DEVICE)
-        kappa = Kappa(feat_shape, num_classes=10).to(DEVICE)
+        kappa = create_kappa(feat_shape, model_type, num_classes=10).to(DEVICE)
 
         phi.load_state_dict({kk: vv.to(DEVICE) for kk, vv in clients_phi_states[k].items()})
         kappa.load_state_dict({kk: vv.to(DEVICE) for kk, vv in clients_kappa_states[k].items()})
-        phi.eval()
-        kappa.eval()
+        phi.eval(); kappa.eval()
 
-        correct_full = 0
-        correct_client = 0
-        correct_selective = 0
-        total = 0  # <--- ADD correct_selective
-        loader = DataLoader(per_client_testsets[k], batch_size=batch_size, num_workers=NUM_WORKERS,
-                            pin_memory=PIN_MEMORY)
-
+        correct_full = correct_client = correct_selective = 0
+        total = 0
+        loader = DataLoader(per_client_testsets[k], batch_size=batch_size, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
         with torch.no_grad():
             for xb, yb in loader:
                 xb = xb.to(DEVICE)
-                if not torch.is_tensor(yb):
-                    yb = torch.tensor(yb, dtype=torch.long)
+                if not torch.is_tensor(yb): yb = torch.tensor(yb, dtype=torch.long)
                 yb = yb.to(DEVICE)
-
                 h = phi(xb)
-
-                # Get soft outputs from both paths
-                out_c_soft = kappa(h)  # Client (kappa) soft output
-                out_s_soft = server_theta(h)  # Server (theta) soft output
-
-                # Calculate predictions
+                out_c_soft = kappa(h)
+                out_s_soft = server_theta(h)
                 pred_c = out_c_soft.argmax(dim=1)
                 pred_s = out_s_soft.argmax(dim=1)
-
-                # --- SplitGP Selective Offloading Logic ---
-                # 1. Compute Shannon Entropy (E) for Client's prediction (Uncertainty)
                 probs_c = F.softmax(out_c_soft, dim=1)
-                # Shannon Entropy E = - sum(p * log2(p)). Add 1e-12 for numerical stability.
                 entropy = -torch.sum(probs_c * torch.log2(probs_c + 1e-12), dim=1)
-                # 2. Decision Mask: Offload if Uncertainty (E) >= Threshold (Eth)
                 offload_mask = entropy >= threshold
-
-                # 3. Final Prediction is selected based on the mask
                 final_pred = torch.where(offload_mask, pred_s, pred_c)
-
-                # Update Accuracy Counts
-                # Fix for correct_client += (pred_c == yb).sum().item()
-                if not torch.is_tensor(pred_c):
-                    pred_c = torch.tensor(pred_c)
-                if not torch.is_tensor(yb):
-                    yb = torch.tensor(yb)
                 correct_client += (pred_c == yb).sum().item()
-
                 correct_full += (pred_s == yb).sum().item()
-                correct_selective += (final_pred == yb).sum().item()  # <--- Selective Accuracy
+                correct_selective += (final_pred == yb).sum().item()
                 total += yb.size(0)
-
-        client_accs.append(correct_client / total if total > 0 else 0.0)
-        full_accs.append(correct_full / total if total > 0 else 0.0)
-        selective_accs.append(correct_selective / total if total > 0 else 0.0)  # <--- Append Selective Acc
+        client_accs.append(correct_client / total if total else 0.0)
+        full_accs.append(correct_full / total if total else 0.0)
+        selective_accs.append(correct_selective / total if total else 0.0)
 
         del phi, kappa, base_local
         torch.cuda.empty_cache()
 
     del server_theta
     torch.cuda.empty_cache()
-    # <--- RETURN SELECTIVE ACCURACY
     return float(np.mean(full_accs)), float(np.mean(client_accs)), float(np.mean(selective_accs))
 
 def train_split_training(in_channels, img_size, split_index,
@@ -354,42 +316,38 @@ def train_split_training(in_channels, img_size, split_index,
                          lr=None,
                          batch=None,
                          rounds=None,
-                         client_loader=None):
-    """
-    SplitGP style training.
-    Returns (clients_phi_states_cpu, clients_kappa_states_cpu, server_theta_state_cpu)
-    """
-
-    # sanity check
+                         client_loader=None,
+                         model_type='SimpleCNN'):
+    """SplitGP style training. Returns client φ/κ and server θ states (CPU)."""
     if client_loader is None:
         raise ValueError("client_loaders must be provided (list or dict of DataLoaders indexed by client id)")
 
-    # base model
-    base = SimpleCNN(in_channels=in_channels, num_classes=10).to(DEVICE)
-    phi_template = Phi(base).to(DEVICE)
-    theta_template = Theta(base).to(DEVICE)
+    base = create_model(model_type, in_channels=in_channels, num_classes=10, split_index=split_index).to(DEVICE)
+    phi_template = create_phi(base, model_type, split_index=split_index).to(DEVICE)
+    theta_template = create_theta(base, model_type, split_index=split_index).to(DEVICE)
 
     feat_shape = probe_phi_feature_shape(phi_template, in_channels=in_channels, img_size=img_size, device=DEVICE)
-    # prepare client copies
     clients_phi = [deepcopy(phi_template).to(DEVICE) for _ in range(K)]
-    clients_kappa = [Kappa(feat_shape, num_classes=10).to(DEVICE) for _ in range(K)]
+    clients_kappa = [create_kappa(feat_shape, model_type, num_classes=10).to(DEVICE) for _ in range(K)]
     server_theta = deepcopy(theta_template).to(DEVICE)
 
-    # initialize broadcast states (CPU)
     phi_state = {k: v.cpu().clone() for k, v in phi_template.state_dict().items()}
     kappa_state = {k: v.cpu().clone() for k, v in clients_kappa[0].state_dict().items()}
     theta_state = {k: v.cpu().clone() for k, v in theta_template.state_dict().items()}
+
+    # If no training rounds, return initial broadcast states for evaluation convenience
+    if rounds is not None and rounds == 0:
+        clients_phi_states_cpu = [ {kk: vv.clone() for kk, vv in phi_state.items()} for _ in range(K) ]
+        clients_kappa_states_cpu = [ {kk: vv.clone() for kk, vv in kappa_state.items()} for _ in range(K) ]
+        server_theta_state_cpu = {k: v.clone() for k, v in theta_state.items()}
+        return clients_phi_states_cpu, clients_kappa_states_cpu, server_theta_state_cpu
 
     clients_phi_states_cpu = None
     clients_kappa_states_cpu = None
 
     for r in tqdm(range(rounds), desc="Global rounds (split)"):
-        client_phi_states = []
-        client_kappa_states = []
-        client_theta_states = []
-
-        for k in tqdm(range(K),desc=" Clients Number ", leave=False):
-            # load broadcast to client (move to device)
+        client_phi_states, client_kappa_states, client_theta_states = [], [], []
+        for k in tqdm(range(K), desc=" Clients Number ", leave=False):
             clients_phi[k].load_state_dict({kk: vv.to(DEVICE) for kk, vv in phi_state.items()})
             clients_kappa[k].load_state_dict({kk: vv.to(DEVICE) for kk, vv in kappa_state.items()})
             server_theta.load_state_dict({kk: vv.to(DEVICE) for kk, vv in theta_state.items()})
@@ -398,174 +356,263 @@ def train_split_training(in_channels, img_size, split_index,
                             list(clients_kappa[k].parameters()) +
                             list(server_theta.parameters()), lr=lr)
 
-            # loader = get_client_loader(k, batch=batch)
             loader = client_loader[k]
-
-            clients_phi[k].train()
-            clients_kappa[k].train()
-            server_theta.train()
+            clients_phi[k].train(); clients_kappa[k].train(); server_theta.train()
 
             for _ in range(LOCAL_EPOCHS):
                 for xb, yb in loader:
                     xb = xb.to(DEVICE)
-                    if not torch.is_tensor(yb):
-                        yb = torch.tensor(yb, dtype=torch.long)
+                    if not torch.is_tensor(yb): yb = torch.tensor(yb, dtype=torch.long)
                     yb = yb.to(DEVICE)
-                    h = clients_phi[k](xb)                     # (B,C,H,W)
+                    h = clients_phi[k](xb)
                     out_c = clients_kappa[k](h)
                     out_s = server_theta(h)
                     loss = gamma * F.cross_entropy(out_c, yb) + (1.0 - gamma) * F.cross_entropy(out_s, yb)
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
+                    opt.zero_grad(); loss.backward(); opt.step()
 
             client_phi_states.append({kk: vv.cpu().clone() for kk, vv in clients_phi[k].state_dict().items()})
             client_kappa_states.append({kk: vv.cpu().clone() for kk, vv in clients_kappa[k].state_dict().items()})
             client_theta_states.append({kk: vv.cpu().clone() for kk, vv in server_theta.state_dict().items()})
+            del opt; torch.cuda.empty_cache()
 
-            del opt
-            torch.cuda.empty_cache()
-
-        # aggregate server theta by FedAvg (CPU)
+        # FedAvg θ
         new_theta = {}
         for key in client_theta_states[0].keys():
             s = sum(client_theta_states[i][key].to(torch.float32) for i in range(K))
             new_theta[key] = (s / K).clone()
         theta_state = new_theta
 
-        # compute avg phi and avg kappa (CPU)
+        # Avg φ, κ
         avg_phi = {}
         for key in client_phi_states[0].keys():
             s = sum(client_phi_states[i][key].to(torch.float32) for i in range(K))
             avg_phi[key] = (s / K).clone()
-
         avg_kappa = {}
         for key in client_kappa_states[0].keys():
             s = sum(client_kappa_states[i][key].to(torch.float32) for i in range(K))
             avg_kappa[key] = (s / K).clone()
 
-        # personalize: new client phi/kappa = lambda * local + (1-lambda) * avg
-        new_client_phi_states = []
-        new_client_kappa_states = []
+        new_client_phi_states, new_client_kappa_states = [], []
         for i in range(K):
-            local_phi = client_phi_states[i]
-            local_kappa = client_kappa_states[i]
-            new_phi = {}
-            new_kappa = {}
+            local_phi, local_kappa = client_phi_states[i], client_kappa_states[i]
+            new_phi, new_kappa = {}, {}
             for key in local_phi.keys():
-                new_phi[key] = (lambda_personalization * local_phi[key].to(torch.float32)
-                                + (1 - lambda_personalization) * avg_phi[key]).clone()
+                new_phi[key] = (lambda_personalization * local_phi[key].to(torch.float32) +
+                                (1 - lambda_personalization) * avg_phi[key]).clone()
             for key in local_kappa.keys():
-                new_kappa[key] = (lambda_personalization * local_kappa[key].to(torch.float32)
-                                  + (1 - lambda_personalization) * avg_kappa[key]).clone()
+                new_kappa[key] = (lambda_personalization * local_kappa[key].to(torch.float32) +
+                                  (1 - lambda_personalization) * avg_kappa[key]).clone()
             new_client_phi_states.append(new_phi)
             new_client_kappa_states.append(new_kappa)
 
-        # broadcast avg for next round initialization
         phi_state = {k: v.clone() for k, v in avg_phi.items()}
         kappa_state = {k: v.clone() for k, v in avg_kappa.items()}
-
-        # store personalized states to return after training
         clients_phi_states_cpu = new_client_phi_states
         clients_kappa_states_cpu = new_client_kappa_states
 
-    # final server theta CPU
     server_theta_state_cpu = {k: v.cpu().clone() for k, v in theta_state.items()}
     return clients_phi_states_cpu, clients_kappa_states_cpu, server_theta_state_cpu
 
 
-def train_personalized_local_only(in_channels, img_size, lr, batch, rounds, client_loader):
-    """
-    Trains K separate full VGG-11 models locally for 'rounds' epochs (full personalization).
-    No communication or aggregation takes place.
-    Returns: list of K full model state dicts (CPU).
-    """
-    # Initialize K independent full VGG models
-    clients_models = [
-        SimpleCNN(in_channels=in_channels, num_classes=10).to(DEVICE)
-        for _ in range(K)
-    ]
+# ---------------------
+# Param counting helpers
+# ---------------------
 
-    # Initialize K independent optimizers
+def count_params(module: nn.Module) -> int:
+    return sum(p.numel() for p in module.parameters())
+
+def count_bn_affine_params(module: nn.Module) -> int:
+    total = 0
+    for m in module.modules():
+        if isinstance(m, nn.BatchNorm2d) and m.affine:
+            total += (m.weight.numel() + m.bias.numel())
+    return total
+
+def train_personalized_local_only(in_channels, img_size, lr, batch, rounds, client_loader, model_type='SimpleCNN'):
+    """Trains K separate full models locally (no communication)."""
+    clients_models = [create_model(model_type, in_channels=in_channels, num_classes=10).to(DEVICE) for _ in range(K)]
     clients_opts = [optim.SGD(model.parameters(), lr=lr) for model in clients_models]
-
     for r in tqdm(range(rounds), desc="Global rounds (Personalized Local)"):
         for k in tqdm(range(K), desc=" Clients Number ", leave=False):
-            model = clients_models[k]
-            opt = clients_opts[k]
-            loader = client_loader[k]
+            model = clients_models[k]; opt = clients_opts[k]; loader = client_loader[k]
             model.train()
-
             for _ in range(LOCAL_EPOCHS):
                 for xb, yb in loader:
                     xb = xb.to(DEVICE)
-                    if not torch.is_tensor(yb):
-                        yb = torch.tensor(yb, dtype=torch.long)
+                    if not torch.is_tensor(yb): yb = torch.tensor(yb, dtype=torch.long)
                     yb = yb.to(DEVICE)
-
                     out = model(xb)
                     loss = F.cross_entropy(out, yb)
-
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-
-    # Return final states of all K personalized models
+                    opt.zero_grad(); loss.backward(); opt.step()
     return [model.state_dict() for model in clients_models]
 
 
-def train_fedavg(in_channels, img_size, lr, batch, rounds, client_loader):
-    """
-    Trains a single global VGG-11 model using Federated Averaging (FedAvg).
-    Returns: a single global model state dict (CPU).
-    """
-    # 1. Initialize a single global model
-    global_model = SimpleCNN(in_channels=in_channels, num_classes=10).to(DEVICE)
+def train_fedavg(in_channels, img_size, lr, batch, rounds, client_loader, model_type='SimpleCNN'):
+    """Training with standard FedAvg on a single global model."""
+    global_model = create_model(model_type, in_channels=in_channels, num_classes=10).to(DEVICE)
     global_state = global_model.state_dict()
-
     for r in tqdm(range(rounds), desc="Global rounds (FedAvg)"):
         client_updates = []
-
         for k in tqdm(range(K), desc=" Clients Number ", leave=False):
-            # 2. Local client training
             local_model = deepcopy(global_model).to(DEVICE)
             opt = optim.SGD(local_model.parameters(), lr=lr)
             loader = client_loader[k]
             local_model.train()
-
             for _ in range(LOCAL_EPOCHS):
                 for xb, yb in loader:
                     xb = xb.to(DEVICE)
-                    if not torch.is_tensor(yb):
-                        yb = torch.tensor(yb, dtype=torch.long)
+                    if not torch.is_tensor(yb): yb = torch.tensor(yb, dtype=torch.long)
                     yb = yb.to(DEVICE)
-
                     out = local_model(xb)
                     loss = F.cross_entropy(out, yb)
-
-                    opt.zero_grad()
-                    loss.backward()
-                    opt.step()
-
-            # 3. Collect update weights (delta_weights)
-            # Since all data sizes are equal (2 shards per client), update aggregation is a simple average.
+                    opt.zero_grad(); loss.backward(); opt.step()
             client_updates.append(local_model.state_dict())
-
-            del local_model, opt
-            torch.cuda.empty_cache()
-
-        # 4. Aggregation (FedAvg)
+            del local_model, opt; torch.cuda.empty_cache()
         new_global_state = {}
         for key in global_state.keys():
-            # Average the weights across all clients
             s = sum(client_updates[i][key].to(torch.float32) for i in range(K))
             new_global_state[key] = (s / K).clone()
-
         global_model.load_state_dict(new_global_state)
-        global_state = new_global_state  # Update state for next round
-
-    # Return final global state
+        global_state = new_global_state
     return global_state
+
+class VGG11(nn.Module):
+    """
+    VGG-11 model for CIFAR10 with optional smaller classifier for paper-scale params.
+    Paper split: |φ|≈972,554, |θ|≈8,258,560, |κ|=10,250
+    """
+    def __init__(self, num_classes=10, split_index=22, in_channels=3, small_classifier=True):
+        super().__init__()
+        self.split_index = split_index
+
+        cfg = [64, 'M', 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M']
+
+        layers = []
+        in_ch = in_channels
+        for v in cfg:
+            if v == 'M':
+                layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+            else:
+                conv2d = nn.Conv2d(in_ch, v, kernel_size=3, padding=1)
+                layers.append(conv2d)
+                layers.append(nn.BatchNorm2d(v))
+                layers.append(nn.ReLU(inplace=True))
+                in_ch = v
+
+        self.features = nn.Sequential(*layers)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        if small_classifier:
+            # Lightweight classifier to match paper's theta parameter scale
+            self.classifier = nn.Sequential(
+                nn.Linear(512, 512), nn.ReLU(True), nn.Dropout(0.5),
+                nn.Linear(512, 256), nn.ReLU(True), nn.Dropout(0.5),
+                nn.Linear(256, num_classes),
+            )
+        else:
+            # Classic VGG-11 classifier (much larger; ~19M params just in classifier)
+            self.classifier = nn.Sequential(
+                nn.Linear(512, 4096), nn.ReLU(True), nn.Dropout(0.5),
+                nn.Linear(4096, 4096), nn.ReLU(True), nn.Dropout(0.5),
+                nn.Linear(4096, num_classes),
+            )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.classifier(x)
+        return x
+
+class VGG11_Kappa(nn.Module):
+    """Aux classifier for VGG11: Adaptive pool to achieve 1024 features then FC->num_classes.
+    This yields |κ| = 1024*classes + classes. For 10 classes -> 10,250."""
+    def __init__(self, feature_shape, num_classes=10, target_features=1024):
+        super().__init__()
+        C, H, W = feature_shape
+        # choose spatial size so that C * s * s == target_features if possible
+        if target_features % C == 0:
+            s2 = target_features // C
+            s = int(round(s2 ** 0.5))
+            if s * s == s2 and s > 0:
+                self.pool = nn.AdaptiveAvgPool2d((s, s))
+                in_feats = C * s * s
+            else:
+                # fallback to flatten if not perfect square
+                self.pool = None
+                in_feats = C * H * W
+        else:
+            self.pool = None
+            in_feats = C * H * W
+        self.fc = nn.Linear(in_feats, num_classes)
+
+    def forward(self, h):
+        if self.pool is not None:
+            h = self.pool(h)
+        h = torch.flatten(h, 1)
+        return self.fc(h)
+
+class VGG11_Theta(nn.Module):
+    """Server-side model for VGG11: remaining features + avgpool + classifier."""
+    def __init__(self, vgg_model, split_index):
+        super().__init__()
+        self.features_tail = nn.Sequential(*list(vgg_model.features.children())[split_index:])
+        self.avgpool = vgg_model.avgpool
+        self.classifier = vgg_model.classifier
+
+    def forward(self, h):
+        x = self.features_tail(h)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.classifier(x)
+        return x
+
+class VGG11_Phi(nn.Module):
+    """Client-side feature extractor for VGG11: first split_index layers."""
+    def __init__(self, vgg_model, split_index):
+        super().__init__()
+        self.net = nn.Sequential(*list(vgg_model.features.children())[:split_index])
+
+    def forward(self, x):
+        return self.net(x)
+
+def create_model(model_type, in_channels, num_classes=10, split_index=22):
+    """Factory function to create SimpleCNN or VGG11 models."""
+    if model_type.lower() == 'simplecnn':
+        return SimpleCNN(in_channels=in_channels, num_classes=num_classes)
+    elif model_type.lower() in ['vgg11', 'vgg-11']:
+        return VGG11(num_classes=num_classes, split_index=split_index, in_channels=in_channels, small_classifier=SMALL_CLASSIFIER)
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+
+def create_phi(cnn_model, model_type='SimpleCNN', split_index=22):
+    """Factory function to create Phi (client-side feature extractor)"""
+    if model_type.lower() == 'simplecnn':
+        return Phi(cnn_model)
+    elif model_type.lower() in ['vgg11', 'vgg-11']:
+        return VGG11_Phi(cnn_model, split_index=split_index)
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+
+
+def create_theta(cnn_model, model_type='SimpleCNN', split_index=22):
+    """Factory function to create Theta (server-side model)"""
+    if model_type.lower() == 'simplecnn':
+        return Theta(cnn_model)
+    elif model_type.lower() in ['vgg11', 'vgg-11']:
+        return VGG11_Theta(cnn_model, split_index=split_index)
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+
+
+def create_kappa(feature_shape, model_type='SimpleCNN', num_classes=10):
+    """Factory function to create Kappa (auxiliary classifier)"""
+    if model_type.lower() == 'simplecnn':
+        return Kappa(feature_shape, num_classes=num_classes)
+    elif model_type.lower() in ['vgg11', 'vgg-11']:
+        return VGG11_Kappa(feature_shape, num_classes=num_classes, target_features=1024)
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+
 if __name__ == "__main__":
 
     args = parse_args()
@@ -594,7 +641,7 @@ if __name__ == "__main__":
     SEED = args.seed
     NUM_WORKERS = args.num_workers
     PIN_MEMORY = not args.no_pin_memory
-    SMALL_CLASSIFIER = False
+    SMALL_CLASSIFIER = args.small_classifier
     PROBE_PRINTS = args.probe
     DATASET = args.dataset
     ETH = args.eth # <--- GET ETH FROM ARGS
@@ -630,18 +677,19 @@ if __name__ == "__main__":
     for p in p_values:
         per_p_testsets[p] = [client_test_set_for_p(k, p) for k in range(K)]
 
-    # CNN model doesn't need split_index like VGG11 - phi is fixed to first 4 conv layers
-    tmp_base = SimpleCNN(in_channels=IN_CHANNELS, num_classes=10)
-
-    # Optional: probe shapes
-    phi_tmp = Phi(tmp_base)
+    # Probe param counts for the selected model
+    tmp_base = create_model(MODEL_TYPE, in_channels=IN_CHANNELS, num_classes=10, split_index=split_index)
+    phi_tmp = create_phi(tmp_base, MODEL_TYPE, split_index=split_index)
     feat_shape = probe_phi_feature_shape(phi_tmp, in_channels=IN_CHANNELS, img_size=IMG_SIZE, device=DEVICE)
-    theta_tmp = Theta(tmp_base)
-    kappa_tmp = Kappa(feat_shape, num_classes=10)
+    theta_tmp = create_theta(tmp_base, MODEL_TYPE, split_index=split_index)
+    kappa_tmp = create_kappa(feat_shape, MODEL_TYPE, num_classes=10)
     phi_param_count = sum(p.numel() for p in phi_tmp.parameters())
     theta_param_count = sum(p.numel() for p in theta_tmp.parameters())
     kappa_param_count = sum(p.numel() for p in kappa_tmp.parameters())
     with open(os.path.join(OUT_DIR, "model_params.txt"), "w") as f:
+        f.write(f"Model type: {MODEL_TYPE}\n")
+        f.write(f"Split index: {split_index}\n")
+        f.write(f"Dataset: {DATASET}\n\n")
         f.write(f"Phi (client-side) parameter count: {phi_param_count}\n")
         f.write(f"Theta (server-side) parameter count: {theta_param_count}\n")
         f.write(f"Kappa (auxiliary classifier) parameter count: {kappa_param_count}\n")
@@ -650,10 +698,15 @@ if __name__ == "__main__":
 
     if PROBE_PRINTS:
         print("Probe phi output feature shape (C,H,W):", feat_shape)
-        print("CNN Architecture:")
-        print("  - Phi (client-side): 4 convolutional layers")
-        print("  - Theta (server-side): 1 convolutional layer + 3 FC layers")
-        print("  - Kappa (auxiliary): 1 FC layer")
+        print(f"Architecture: {MODEL_TYPE}")
+        if MODEL_TYPE.lower() == 'simplecnn':
+            print("  - Phi (client-side): 4 convolutional layers")
+            print("  - Theta (server-side): 1 convolutional layer + 3 FC layers")
+            print("  - Kappa (auxiliary): 1 FC layer")
+        else:
+            print("  - Phi (client-side): subset of VGG11.features up to split_index")
+            print("  - Theta (server-side): remaining features + avgpool + classifier")
+            print("  - Kappa (auxiliary): 1 FC layer on flattened phi output (or pooled)")
 
     results = defaultdict(list)
 
@@ -669,7 +722,8 @@ if __name__ == "__main__":
                                                                             lr=LR,
                                                                             batch=BATCH,
                                                                             rounds=ROUNDS,
-                                                                            client_loader=client_loaders
+                                                                            client_loader=client_loaders,
+                                                                            model_type=MODEL_TYPE
                                                                             )
 
         for p in p_values:
@@ -681,7 +735,9 @@ if __name__ == "__main__":
                                                          img_size=IMG_SIZE,
                                                          split_index=split_index,
                                                          threshold=ETH,
-                                                         batch_size=BATCH)
+                                                         batch_size=BATCH,
+                                                         model_type=MODEL_TYPE
+                                                         )
             results['Multi-Exit'].append(full_acc)
             # results['Multi-Exit-Clien'].append(client_acc)
 
@@ -706,7 +762,9 @@ if __name__ == "__main__":
             lr=LR,
             batch=BATCH,
             rounds=ROUNDS,
-            client_loader=client_loaders)
+            client_loader=client_loaders,
+            model_type=MODEL_TYPE
+        )
 
         # Inner loop: Sweep Eth (Inference Hyperparameter)
 
@@ -736,7 +794,9 @@ if __name__ == "__main__":
                     img_size=IMG_SIZE,
                     split_index=split_index,
                     threshold=eth,  # Use current Eth
-                    batch_size=BATCH)
+                    batch_size=BATCH,
+                    model_type=MODEL_TYPE
+                )
 
                 # Record results into the temporary dictionary
                 current_result_set["p"].append(p)
@@ -877,12 +937,13 @@ if __name__ == "__main__":
                                                        batch=BATCH,
                                                        rounds=ROUNDS,
                                                        lr=LR,
-                                                       client_loader=client_loaders)
+                                                       client_loader=client_loaders,
+                                                       model_type=MODEL_TYPE)
         # Evaluate each client's unique full model
         for p in p_values:
             # Note: This uses the existing evaluation helper for K full models.
             avg_acc = evaluate_method_full_models(personal_states, per_p_testsets[p], in_channels=IN_CHANNELS,
-                                                  img_size=IMG_SIZE, batch_size=BATCH)
+                                                  img_size=IMG_SIZE, batch_size=BATCH, model_type=MODEL_TYPE)
             results['Personalized'].append(avg_acc)
             print(f"p={p:.2f} Personalized avg acc: {avg_acc:.4f}")
         pd.DataFrame({'Personalized': results['Personalized']}, index=p_values).to_csv(
@@ -897,7 +958,7 @@ if __name__ == "__main__":
                                     batch=BATCH,
                                     rounds=ROUNDS,
                                     lr=LR,
-                                    client_loader=client_loaders)
+                                    client_loader=client_loaders, model_type=MODEL_TYPE)
 
         # Prepare a list of K identical states for the evaluation helper
         global_states_list = [global_state] * K
@@ -906,7 +967,7 @@ if __name__ == "__main__":
         for p in p_values:
             # Note: This uses the evaluation helper for K full models, but they are all identical.
             avg_acc = evaluate_method_full_models(global_states_list, per_p_testsets[p], in_channels=IN_CHANNELS,
-                                                  img_size=IMG_SIZE, batch_size=BATCH)
+                                                  img_size=IMG_SIZE, batch_size=BATCH, model_type=MODEL_TYPE)
             results['FedAvg Global'].append(avg_acc)
             print(f"p={p:.2f} FedAvg Global avg acc: {avg_acc:.4f}")
 
