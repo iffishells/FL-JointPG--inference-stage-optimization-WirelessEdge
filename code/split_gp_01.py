@@ -57,9 +57,8 @@ def parse_args():
     parser.add_argument("--method", type=str, default="splitgp",
                         choices=["splitgp", "multi-exit", "personalized", "fedavg", "all"],
                         help="Which training method to run")
-    parser.add_argument("--split_index", type=int, default=11, help="SplitIndex") # <--- ADD THIS LINE
-
-
+    parser.add_argument("--split_index", type=int, default=11, help="SplitIndex")
+    parser.add_argument("--model", type=str, default="SimpleCNN", help="Model type for results folder (e.g., SimpleCNN, VGG11)")
 
     return parser.parse_args()
 # -------------------------
@@ -603,22 +602,18 @@ if __name__ == "__main__":
     ETH = args.eth # <--- GET ETH FROM ARGS
     split_index = args.split_index
     method = args.method
+    MODEL_TYPE = args.model  # Use model type from command-line argument
     results_folder_name = "results"
     os.makedirs(results_folder_name, exist_ok=True)
-
-    p_values = [0.0 ,0.2,0.4,0.6,0.8,1.0]  # OOD fractions to evaluate
-    OUT_DIR = f"{results_folder_name}/splitgp_cnn_results_{DATASET}_method_{method}_rounds_{ROUNDS}_clients_{K}_gamma_{GAMMA}_lambda_split_{LAMBDA_SPLITGP}_ETH_{ETH}"
-    print("out dir",OUT_DIR)
+    model_folder = os.path.join(results_folder_name, MODEL_TYPE)
+    os.makedirs(model_folder, exist_ok=True)
+    dataset_folder = os.path.join(model_folder, DATASET)
+    os.makedirs(dataset_folder, exist_ok=True)
+    OUT_DIR = os.path.join(dataset_folder, f"splitgp_method_{method}_rounds_{ROUNDS}_clients_{K}_gamma_{GAMMA}_lambda_split_{LAMBDA_SPLITGP}_ETH_{ETH}")
+    print("out dir", OUT_DIR)
     os.makedirs(OUT_DIR, exist_ok=True)
-
-    # list_of_previous_experiments = os.listdir(OUT_DIR)
-    #
-    # if OUT_DIR in list_of_previous_experiments:
-    #     print(f"Experiment with name {OUT_DIR} already exists. Please choose a different name.")
-    #     exit(0)
-    # else:
-    #     print(f"Experiment with name {OUT_DIR} will be created.")
-
+    eth_thresholds = [0.05,0.1,0.2,0.4,0.8,1.2,1.6,2.3]
+    p_values = [0,0.2,0.4,0.6,0.8,1.0]
 
     # ---- Run methods ----
     methods_to_run = [args.method] if args.method != "all" else ["splitgp", "fedavg", "personalized", "multi-exit"]
@@ -643,6 +638,18 @@ if __name__ == "__main__":
     # Optional: probe shapes
     phi_tmp = Phi(tmp_base)
     feat_shape = probe_phi_feature_shape(phi_tmp, in_channels=IN_CHANNELS, img_size=IMG_SIZE, device=DEVICE)
+    theta_tmp = Theta(tmp_base)
+    kappa_tmp = Kappa(feat_shape, num_classes=10)
+    phi_param_count = sum(p.numel() for p in phi_tmp.parameters())
+    theta_param_count = sum(p.numel() for p in theta_tmp.parameters())
+    kappa_param_count = sum(p.numel() for p in kappa_tmp.parameters())
+    with open(os.path.join(OUT_DIR, "model_params.txt"), "w") as f:
+        f.write(f"Phi (client-side) parameter count: {phi_param_count}\n")
+        f.write(f"Theta (server-side) parameter count: {theta_param_count}\n")
+        f.write(f"Kappa (auxiliary classifier) parameter count: {kappa_param_count}\n")
+        f.write(f"\nTotal client-side parameters (Phi + Kappa): {phi_param_count + kappa_param_count}\n")
+        f.write(f"Total server-side parameters (Theta): {theta_param_count}\n")
+
     if PROBE_PRINTS:
         print("Probe phi output feature shape (C,H,W):", feat_shape)
         print("CNN Architecture:")
@@ -689,6 +696,7 @@ if __name__ == "__main__":
         print("Saved CSV ->", csv_path)
 
     all_sweep_results = []
+
     if "splitgp" in methods_to_run:
 
         clients_phi_sgp, clients_kappa_sgp, server_theta_sgp = train_split_training(
