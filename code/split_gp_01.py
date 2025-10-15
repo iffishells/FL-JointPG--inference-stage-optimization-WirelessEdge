@@ -752,9 +752,15 @@ if __name__ == "__main__":
                 )
 
             df_temp = pd.DataFrame(current_result_set)
-            df = pd.DataFrame(current_result_set, index=p_values)
-            df.index.name = 'p'
-            csv_name = f"{method}_combined_results_eth_{eth:.2f}_gamma_{GAMMA}_lambda_split_{LAMBDA_SPLITGP}.csv"  # 👈 separate CSV per Eth
+
+            # Convert to percentage before saving
+            for col in ["full_acc", "client_acc", "selective_acc"]:
+                if col in df_temp.columns:
+                    df_temp[col] = df_temp[col] * 100
+
+            df = df_temp.copy()
+            df = df.set_index('p')
+            csv_name = f"{method}_combined_results_eth_{eth:.2f}_gamma_{GAMMA}_lambda_split_{LAMBDA_SPLITGP}.csv"
             csv_path = os.path.join(OUT_DIR, csv_name)
             df.to_csv(csv_path)
             print("Saved CSV ->", csv_path)
@@ -773,6 +779,95 @@ if __name__ == "__main__":
             print(f"✅ SUCCESSFULLY SAVED FINAL SWEEP RESULTS to -> {csv_path}")
             print("========================================================")
 
+            # Create visualization plots for SplitGP results
+            print("\n📊 Creating SplitGP visualization plots...")
+
+            # Plot 1: Selective Accuracy vs p for different Eth values
+            plt.figure(figsize=(10, 6))
+            for eth in eth_thresholds:
+                eth_data = df_final[df_final['eth'] == eth]
+                if not eth_data.empty:
+                    plt.plot(eth_data['p'], eth_data['selective_acc'],
+                            marker='o', label=f'Eth={eth:.2f}', linewidth=2)
+
+            plt.xlabel("p (OOD proportion)", fontsize=12)
+            plt.ylabel("Selective Accuracy (%)", fontsize=12)
+            plt.title(f"SplitGP on {DATASET}: Selective Accuracy vs OOD (γ={GAMMA}, λ={LAMBDA_SPLITGP})", fontsize=13)
+            plt.xticks(p_values)
+            plt.ylim(0, 105)
+            plt.grid(True, alpha=0.3)
+            plt.legend(fontsize=9, ncol=2)
+            plt.tight_layout()
+
+            plot_path = os.path.join(OUT_DIR, "splitgp_selective_acc_vs_p_eth_sweep.png")
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            plt.savefig(plot_path.replace('.png', '.pdf'), bbox_inches='tight')
+            print(f"✅ Saved: {plot_path}")
+            plt.close()
+
+            # Plot 2: Client vs Server vs Selective Accuracy for a specific Eth
+            best_eth_idx = len(eth_thresholds) // 2  # Middle Eth value
+            best_eth = eth_thresholds[best_eth_idx]
+            eth_data = df_final[df_final['eth'] == best_eth]
+
+            if not eth_data.empty:
+                plt.figure(figsize=(10, 6))
+                plt.plot(eth_data['p'], eth_data['client_acc'],
+                        marker='s', label='Client-side (κ)', linewidth=2, markersize=8)
+                plt.plot(eth_data['p'], eth_data['full_acc'],
+                        marker='^', label='Server-side (θ)', linewidth=2, markersize=8)
+                plt.plot(eth_data['p'], eth_data['selective_acc'],
+                        marker='o', label=f'Selective (Eth={best_eth:.2f})', linewidth=2.5, markersize=8)
+
+                plt.xlabel("p (OOD proportion)", fontsize=12)
+                plt.ylabel("Test Accuracy (%)", fontsize=12)
+                plt.title(f"SplitGP on {DATASET}: Comparison (γ={GAMMA}, λ={LAMBDA_SPLITGP}, Eth={best_eth:.2f})", fontsize=13)
+                plt.xticks(p_values)
+                plt.ylim(0, 105)
+                plt.grid(True, alpha=0.3)
+                plt.legend(fontsize=10)
+                plt.tight_layout()
+
+                plot_path = os.path.join(OUT_DIR, f"splitgp_comparison_eth_{best_eth:.2f}.png")
+                plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+                plt.savefig(plot_path.replace('.png', '.pdf'), bbox_inches='tight')
+                print(f"✅ Saved: {plot_path}")
+                plt.close()
+
+            # Plot 3: Heatmap of Selective Accuracy (Eth vs p)
+            pivot_table = df_final.pivot_table(values='selective_acc',
+                                               index='eth', columns='p',
+                                               aggfunc='first')
+
+            plt.figure(figsize=(10, 6))
+            im = plt.imshow(pivot_table.values, aspect='auto', cmap='YlGnBu',
+                           vmin=0, vmax=100)
+            plt.colorbar(im, label='Selective Accuracy (%)')
+
+            plt.xlabel("p (OOD proportion)", fontsize=12)
+            plt.ylabel("Entropy Threshold (Eth)", fontsize=12)
+            plt.title(f"SplitGP on {DATASET}: Selective Accuracy Heatmap (γ={GAMMA}, λ={LAMBDA_SPLITGP})", fontsize=13)
+
+            plt.xticks(range(len(pivot_table.columns)), [f'{p:.1f}' for p in pivot_table.columns])
+            plt.yticks(range(len(pivot_table.index)), [f'{e:.2f}' for e in pivot_table.index])
+
+            # Add text annotations
+            for i in range(len(pivot_table.index)):
+                for j in range(len(pivot_table.columns)):
+                    val = pivot_table.values[i, j]
+                    if not np.isnan(val):
+                        color = 'white' if val < 50 else 'black'
+                        plt.text(j, i, f'{val:.1f}', ha='center', va='center',
+                                color=color, fontsize=9, weight='bold')
+
+            plt.tight_layout()
+            plot_path = os.path.join(OUT_DIR, "splitgp_heatmap_eth_vs_p.png")
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            plt.savefig(plot_path.replace('.png', '.pdf'), bbox_inches='tight')
+            print(f"✅ Saved: {plot_path}")
+            plt.close()
+
+            print("\n✅ All SplitGP visualization plots created successfully!\n")
     if "personalized" in methods_to_run:
         print("Personalized (local-only) training ...")
         # 3) Personalized local-only baseline (full models per client)
@@ -829,18 +924,29 @@ if __name__ == "__main__":
         df.to_csv(csv_path, index=False)
 
     # Plot
-    print("Plotting results ...")
-    plt.figure(figsize=(8,6))
-    for method, accs in results.items():
-        plt.plot(p_values, accs, marker='o', label=method)
-    plt.xlabel("p (relative portion of OOD samples)")
-    plt.ylabel("Test accuracy")
-    plt.title(f"{method}: Accuracy vs p")
-    plt.xticks(p_values)
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(OUT_DIR, "accuracy_vs_p.png"), dpi=300)
-    plt.savefig(os.path.join(OUT_DIR, "accuracy_vs_p.pdf"))
-    print("Saved plot ->", os.path.join(OUT_DIR, "accuracy_vs_p.png"))
-    plt.show()
+    # Plot results only if there are any methods in the results dict
+    if results:
+        print("Plotting results ...")
+        plt.figure(figsize=(10, 6))
+        for method_name, accs in results.items():
+            # Convert to percentage for plotting
+            accs_pct = [a * 100 for a in accs]
+            plt.plot(p_values, accs_pct, marker='o', label=method_name, linewidth=2)
+
+        plt.xlabel("p (OOD proportion)", fontsize=12)
+        plt.ylabel("Test Accuracy (%)", fontsize=12)
+        plt.title(f"{DATASET} - Accuracy vs OOD Proportion (p)", fontsize=14)
+        plt.xticks(p_values)
+        plt.ylim(0, 105)  # Set y-axis to 0-105% for better visualization
+        plt.grid(True, alpha=0.3)
+        plt.legend(fontsize=10)
+        plt.tight_layout()
+
+        plot_png = os.path.join(OUT_DIR, "accuracy_vs_p.png")
+        plot_pdf = os.path.join(OUT_DIR, "accuracy_vs_p.pdf")
+        plt.savefig(plot_png, dpi=300, bbox_inches='tight')
+        plt.savefig(plot_pdf, bbox_inches='tight')
+        print(f"Saved plot -> {plot_png}")
+        plt.close()
+    else:
+        print("No results to plot (results dict is empty).")
