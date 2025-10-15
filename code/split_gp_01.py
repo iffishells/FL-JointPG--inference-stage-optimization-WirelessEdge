@@ -105,29 +105,34 @@ def create_clients_shards(dataset, K=20, shards=100):
 
 
 class SimpleCNN(nn.Module):
-    """CNN model for MNIST/FMNIST with 5 conv layers + 3 FC layers"""
+    """CNN model for MNIST/FMNIST with 5 conv layers + 3 FC layers (Paper-aligned)"""
     def __init__(self, in_channels=1, num_classes=10):
         super().__init__()
+        # Convolutions (all 3x3, padding=1, bias=True)
         self.conv1 = nn.Conv2d(in_channels, 32, 3, 1, padding=1)
         self.conv2 = nn.Conv2d(32, 64, 3, 1, padding=1)
         self.conv3 = nn.Conv2d(64, 128, 3, 1, padding=1)
-        self.conv4 = nn.Conv2d(128, 128, 3, 1, padding=1)
-        self.conv5 = nn.Conv2d(128, 256, 3, 1, padding=1)
+        self.conv4 = nn.Conv2d(128, 256, 3, 1, padding=1)   # φ ends here
+        self.conv5 = nn.Conv2d(256, 256, 3, 1, padding=1)   # θ starts here
         self.pool = nn.MaxPool2d(2)
-        self.gap = nn.AdaptiveAvgPool2d((1,1))
-        self.fc1 = nn.Linear(256, 512)
-        self.fc2 = nn.Linear(512, 256)
-        self.fc3 = nn.Linear(256, num_classes)
+
+        # Compute fc1 input size depending on dataset family
+        # MNIST/FMNISt (in_channels==1): φ output 28->14->7->3 => 256*3*3
+        # CIFAR10 (in_channels==3):      32->16->8->4        => 256*4*4
+        fc1_in = 256 * (3 * 3 if in_channels == 1 else 4 * 4)
+
+        # Fully connected layers (θ side): 2304/4096 -> 1024 -> 512 -> 10
+        self.fc1 = nn.Linear(fc1_in, 1024)
+        self.fc2 = nn.Linear(1024, 512)
+        self.fc3 = nn.Linear(512, num_classes)
 
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        # x = self.pool(x)
+        # Full-model forward (used only for baselines)
+        x = F.relu(self.conv1(x)); x = self.pool(x)     # 28->14 (or 32->16)
         x = F.relu(self.conv2(x))
-        # x = self.pool(x)
-        x = F.relu(self.conv3(x))
-        x = F.relu(self.conv4(x))
+        x = F.relu(self.conv3(x)); x = self.pool(x)     # 14->7 (or 16->8)
+        x = F.relu(self.conv4(x)); x = self.pool(x)     # 7->3 (or 8->4)
         x = F.relu(self.conv5(x))
-        x = self.gap(x)
         x = torch.flatten(x, 1)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
@@ -135,10 +140,9 @@ class SimpleCNN(nn.Module):
 
 
 class Phi(nn.Module):
-    """Client-side feature extractor: first 4 conv layers of SimpleCNN (phi)."""
+    """Client-side feature extractor: conv1..conv4 with pooling after conv1, conv3, conv4."""
     def __init__(self, cnn_model):
         super().__init__()
-        # Client-side: conv1 -> conv4 (4 convolutional layers as per paper)
         self.conv1 = cnn_model.conv1
         self.conv2 = cnn_model.conv2
         self.conv3 = cnn_model.conv3
@@ -146,39 +150,33 @@ class Phi(nn.Module):
         self.pool = cnn_model.pool
 
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        # x = self.pool(x)
+        x = F.relu(self.conv1(x)); x = self.pool(x)     # 28->14
         x = F.relu(self.conv2(x))
-        # x = self.pool(x)
-        x = F.relu(self.conv3(x))
-        x = F.relu(self.conv4(x))
+        x = F.relu(self.conv3(x)); x = self.pool(x)     # 14->7
+        x = F.relu(self.conv4(x)); x = self.pool(x)     # 7->3
         return x
 
 class Theta(nn.Module):
-    """Server-side model: remaining conv layer + classifier (theta)."""
+    """Server-side model: conv5 + fc1..fc3."""
     def __init__(self, cnn_model):
         super().__init__()
-        # Server-side: conv5 + 3 FC layers
         self.conv5 = cnn_model.conv5
-        self.gap = cnn_model.gap
         self.fc1 = cnn_model.fc1
         self.fc2 = cnn_model.fc2
         self.fc3 = cnn_model.fc3
 
     def forward(self, h):
-        # h expected 4-D: (B,C,H,W) from phi
         x = F.relu(self.conv5(h))
-        x = self.gap(x)
         x = torch.flatten(x, 1)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         return self.fc3(x)
 
 class Kappa(nn.Module):
-    """Auxiliary classifier on top of phi features (flatten then linear)."""
+    """Auxiliary classifier: single FC on top of φ output; matches paper |κ| when MNIST/FMNiST."""
     def __init__(self, feature_shape, num_classes=10):
         super().__init__()
-        flat = int(np.prod(feature_shape))  # C*H*W
+        flat = int(np.prod(feature_shape))
         self.fc = nn.Linear(flat, num_classes)
 
     def forward(self, h):
