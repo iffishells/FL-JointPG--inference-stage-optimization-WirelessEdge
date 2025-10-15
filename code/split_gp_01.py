@@ -428,6 +428,13 @@ def count_bn_affine_params(module: nn.Module) -> int:
             total += (m.weight.numel() + m.bias.numel())
     return total
 
+def count_conv_bias_params(module: nn.Module) -> int:
+    total = 0
+    for m in module.modules():
+        if isinstance(m, nn.Conv2d) and m.bias is not None:
+            total += m.bias.numel()
+    return total
+
 def train_personalized_local_only(in_channels, img_size, lr, batch, rounds, client_loader, model_type='SimpleCNN'):
     """Trains K separate full models locally (no communication)."""
     clients_models = [create_model(model_type, in_channels=in_channels, num_classes=10).to(DEVICE) for _ in range(K)]
@@ -683,18 +690,40 @@ if __name__ == "__main__":
     feat_shape = probe_phi_feature_shape(phi_tmp, in_channels=IN_CHANNELS, img_size=IMG_SIZE, device=DEVICE)
     theta_tmp = create_theta(tmp_base, MODEL_TYPE, split_index=split_index)
     kappa_tmp = create_kappa(feat_shape, MODEL_TYPE, num_classes=10)
+
     phi_param_count = sum(p.numel() for p in phi_tmp.parameters())
     theta_param_count = sum(p.numel() for p in theta_tmp.parameters())
     kappa_param_count = sum(p.numel() for p in kappa_tmp.parameters())
+
+    # Detailed breakdown for VGG11
+    theta_tail_params = None
+    theta_classifier_params = None
+    theta_tail_bn_affine = None
+    theta_tail_conv_bias = None
+    if MODEL_TYPE.lower() in ['vgg11', 'vgg-11']:
+        tail = VGG11_Theta(tmp_base, split_index).features_tail
+        theta_tail_params = count_params(tail)
+        theta_tail_bn_affine = count_bn_affine_params(tail)
+        theta_tail_conv_bias = count_conv_bias_params(tail)
+        theta_classifier_params = count_params(tmp_base.classifier)
+
     with open(os.path.join(OUT_DIR, "model_params.txt"), "w") as f:
         f.write(f"Model type: {MODEL_TYPE}\n")
         f.write(f"Split index: {split_index}\n")
         f.write(f"Dataset: {DATASET}\n\n")
-        f.write(f"Phi (client-side) parameter count: {phi_param_count}\n")
-        f.write(f"Theta (server-side) parameter count: {theta_param_count}\n")
+        f.write(f"Phi (client-side) parameter count (phi only): {phi_param_count}\n")
         f.write(f"Kappa (auxiliary classifier) parameter count: {kappa_param_count}\n")
-        f.write(f"\nTotal client-side parameters (Phi + Kappa): {phi_param_count + kappa_param_count}\n")
-        f.write(f"Total server-side parameters (Theta): {theta_param_count}\n")
+        f.write(f"Total client-side parameters (Phi + Kappa): {phi_param_count + kappa_param_count}\n\n")
+        f.write(f"Theta (server-side) TOTAL parameter count: {theta_param_count}\n")
+        if theta_tail_params is not None:
+            f.write(f"  - Theta features tail params: {theta_tail_params}\n")
+            f.write(f"  - Theta classifier params: {theta_classifier_params}\n")
+            f.write(f"  - Theta BN affine params in tail: {theta_tail_bn_affine}\n")
+            f.write(f"  - Theta conv bias params in tail: {theta_tail_conv_bias}\n")
+            approx_paper_theta = theta_tail_params - (theta_tail_bn_affine or 0)
+            f.write(f"Approx. paper Theta (features only, no BN affine, no classifier): {approx_paper_theta}\n")
+            approx_paper_theta_strict = theta_tail_params - (theta_tail_bn_affine or 0) - (theta_tail_conv_bias or 0)
+            f.write(f"Approx. paper Theta strict (features only, no BN affine, no conv bias, no classifier): {approx_paper_theta_strict}\n")
 
     if PROBE_PRINTS:
         print("Probe phi output feature shape (C,H,W):", feat_shape)
