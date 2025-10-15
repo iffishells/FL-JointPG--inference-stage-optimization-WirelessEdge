@@ -121,8 +121,10 @@ class SimpleCNN(nn.Module):
         self.fc3 = nn.Linear(256, num_classes)
 
     def forward(self, x):
-        x = F.relu(self.conv1(x)); x = self.pool(x)
-        x = F.relu(self.conv2(x)); x = self.pool(x)
+        x = F.relu(self.conv1(x))
+        # x = self.pool(x)
+        x = F.relu(self.conv2(x))
+        # x = self.pool(x)
         x = F.relu(self.conv3(x))
         x = F.relu(self.conv4(x))
         x = F.relu(self.conv5(x))
@@ -145,8 +147,10 @@ class Phi(nn.Module):
         self.pool = cnn_model.pool
 
     def forward(self, x):
-        x = F.relu(self.conv1(x)); x = self.pool(x)
-        x = F.relu(self.conv2(x)); x = self.pool(x)
+        x = F.relu(self.conv1(x))
+        # x = self.pool(x)
+        x = F.relu(self.conv2(x))
+        # x = self.pool(x)
         x = F.relu(self.conv3(x))
         x = F.relu(self.conv4(x))
         return x
@@ -233,7 +237,14 @@ def evaluate_method_full_models(clients_state_dicts, per_client_testsets, in_cha
                 yb = yb.to(DEVICE)
                 out = cnn(xb)
                 pred = out.argmax(dim=1)
+
+                # Fix for correct += (pred == yb).sum().item()
+                if not torch.is_tensor(pred):
+                    pred = torch.tensor(pred)
+                if not torch.is_tensor(yb):
+                    yb = torch.tensor(yb)
                 correct += (pred == yb).sum().item()
+
                 total += yb.size(0)
         accs.append(correct / total if total > 0 else 0.0)
         del cnn
@@ -317,7 +328,13 @@ def evaluate_method_split(clients_phi_states,
                 final_pred = torch.where(offload_mask, pred_s, pred_c)
 
                 # Update Accuracy Counts
+                # Fix for correct_client += (pred_c == yb).sum().item()
+                if not torch.is_tensor(pred_c):
+                    pred_c = torch.tensor(pred_c)
+                if not torch.is_tensor(yb):
+                    yb = torch.tensor(yb)
                 correct_client += (pred_c == yb).sum().item()
+
                 correct_full += (pred_s == yb).sum().item()
                 correct_selective += (final_pred == yb).sum().item()  # <--- Selective Accuracy
                 total += yb.size(0)
@@ -667,31 +684,13 @@ if __name__ == "__main__":
 
         df = pd.DataFrame(results, index=p_values)
         df.index.name = 'p'
-        csv_path = os.path.join(OUT_DIR, "multi-exist.csv")
+        csv_path = os.path.join(OUT_DIR, "multi-exit_combined_results_eth_{ETH}_gamma_{GAMMA}_lambda_split_{LAMBDA_SPLITGP}.csv")
         df.to_csv(csv_path)
         print("Saved CSV ->", csv_path)
 
     all_sweep_results = []
-    p_values = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
-    lambda_values = [0.5, 0.8, 1.0]
-    gamma_values = [0.0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0]
-    eth_thresholds = [0.05,0.1,0.2,0.8,1.2,1.6,2.3, 2.5, 2.7, 2.8, 3.0]
-
-    # sudo testing
-    # lambda_values = [ 0.5]
-    # gamma_values = [0.5]
-    # eth_thresholds = [2.5]
     if "splitgp" in methods_to_run:
 
-        # 2) SplitGP (lambda = LAMBDA_SPLITGP)
-        print("Training SplitGP (lambda=%.2f) ..." % (LAMBDA_SPLITGP))
-        # for LAMBDA_SPLITGP in lambda_values:
-        #
-        #     # Outer loop: Sweep Gamma (Training Hyperparameter)
-        #     for GAMMA in gamma_values :
-        #         print(f"\n--- Training with GAMMA={GAMMA:.2f} and lambda : {LAMBDA_SPLITGP:.2f} ---")
-
-        # 1. Train the model for this specific GAMMA value
         clients_phi_sgp, clients_kappa_sgp, server_theta_sgp = train_split_training(
             in_channels=IN_CHANNELS,
             img_size=IMG_SIZE,
@@ -786,7 +785,7 @@ if __name__ == "__main__":
             results['Personalized'].append(avg_acc)
             print(f"p={p:.2f} Personalized avg acc: {avg_acc:.4f}")
         pd.DataFrame({'Personalized': results['Personalized']}, index=p_values).to_csv(
-            os.path.join(OUT_DIR, 'personalized.csv'))
+            os.path.join(OUT_DIR, "personalized_sweep.csv"))
 
     if "fedavg" in methods_to_run:
         print("Training FedAvg ...")
@@ -813,6 +812,15 @@ if __name__ == "__main__":
         pd.DataFrame({'FedAvg Global': results['FedAvg Global']}, index=p_values).to_csv(
             os.path.join(OUT_DIR, 'fedavg_global.csv'))
 
+
+    # Before saving any DataFrame to CSV, convert accuracy columns to percentage
+    accuracy_cols = ["selective_acc", "full_acc", "client_acc", "Personalized", "FedAvg Global"]
+
+    def save_df_to_csv(df, csv_path):
+        for col in accuracy_cols:
+            if col in df.columns:
+                df[col] = df[col] * 100
+        df.to_csv(csv_path, index=False)
 
     # Plot
     print("Plotting results ...")
