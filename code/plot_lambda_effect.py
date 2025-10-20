@@ -1,0 +1,309 @@
+"""
+Lambda Effect Analysis Script - Simplified Version
+Creates a clean plot showing Test Accuracy vs ρ for different lambda values.
+Replicates Figure 7 from the paper.
+"""
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import glob
+import re
+import numpy as np
+import os
+import argparse
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Analyze lambda effect on model performance')
+    parser.add_argument('--base_folder', type=str, required=True,
+                       help='Base folder containing results (e.g., results/SimpleCNN/MNIST/)')
+    parser.add_argument('--rounds', type=int, default=None,
+                       help='Number of training rounds (e.g., 120)')
+    parser.add_argument('--clients', type=int, default=None,
+                       help='Number of clients (e.g., 50)')
+    parser.add_argument('--eth', type=float, default=None,
+                       help='Specific ETH value to filter (e.g., 0.05). If None, uses all ETH values')
+    parser.add_argument('--gamma', type=float, default=None,
+                       help='Specific gamma value to filter (e.g., 0.5). If None, uses all gamma values')
+    parser.add_argument('--output', type=str, default='lambda_effect_plot.png',
+                       help='Output filename for the plot')
+    parser.add_argument('--dataset_name', type=str, default='',
+                       help='Dataset name for plot title (e.g., MNIST, FMNIST)')
+    parser.add_argument('--figsize', type=str, default='10,6',
+                       help='Figure size as width,height (e.g., 10,6)')
+    return parser.parse_args()
+
+def extract_params_from_filename(filename):
+    """Extract ETH, gamma, and lambda values from filename"""
+    params = {}
+    
+    # Extract ETH value
+    eth_match = re.search(r'eth_([\d.]+)', filename)
+    if eth_match:
+        try:
+            params['eth'] = float(eth_match.group(1))
+        except ValueError:
+            pass
+    
+    # Extract gamma value
+    gamma_match = re.search(r'gamma_([\d.]+)', filename)
+    if gamma_match:
+        try:
+            params['gamma'] = float(gamma_match.group(1))
+        except ValueError:
+            pass
+    
+    # Extract lambda value - must come before .csv extension
+    lambda_match = re.search(r'lambda_split_([\d.]+)\.csv', filename)
+    if lambda_match:
+        try:
+            params['lambda'] = float(lambda_match.group(1))
+        except ValueError:
+            pass
+    
+    return params
+
+def load_results(base_folder, rounds_filter=None, clients_filter=None, eth_filter=None, gamma_filter=None):
+    """Load all CSV files from the base folder and organize by lambda value"""
+    
+    # Build the search pattern based on provided filters
+    if rounds_filter is not None and clients_filter is not None:
+        # Search in specific folder matching rounds and clients
+        folder_pattern = f'splitgp_method_splitgp_rounds_{rounds_filter}_clients_{clients_filter}_gamma_*_lambda_split_*_ETH_*'
+        pattern = os.path.join(base_folder, folder_pattern, 'splitgp_combined*.csv')
+    elif rounds_filter is not None:
+        # Search for folders matching rounds only
+        folder_pattern = f'splitgp_method_splitgp_rounds_{rounds_filter}_clients_*_gamma_*_lambda_split_*_ETH_*'
+        pattern = os.path.join(base_folder, folder_pattern, 'splitgp_combined*.csv')
+    elif clients_filter is not None:
+        # Search for folders matching clients only
+        folder_pattern = f'splitgp_method_splitgp_rounds_*_clients_{clients_filter}_gamma_*_lambda_split_*_ETH_*'
+        pattern = os.path.join(base_folder, folder_pattern, 'splitgp_combined*.csv')
+    else:
+        # Search all folders
+        pattern = os.path.join(base_folder, 'splitgp_method_splitgp_*/splitgp_combined*.csv')
+
+    filepaths = glob.glob(pattern)
+    
+    print(f"Searching in: {base_folder}")
+    print(f"Search pattern: {pattern}")
+    print(f"len : {len(filepaths)}")
+
+    
+    lambda_data = {}
+    
+    for filepath in filepaths:
+        filename = os.path.basename(filepath)
+        
+        # Extract parameters from filename
+        params = extract_params_from_filename(filename)
+        
+        if 'lambda' not in params:
+            print(f"  Skipping {filename} - no lambda value found")
+            continue
+        
+        # Apply filters
+        if eth_filter is not None and params.get('eth') != eth_filter:
+            continue
+        
+        if gamma_filter is not None and params.get('gamma') != gamma_filter:
+            continue
+        
+        # Read the CSV file
+        try:
+            print(f"  filepath {filepath}...")
+            df = pd.read_csv(filepath)
+
+            # Check if dataframe is empty
+            if df.empty:
+                print(f"  Skipping {filename} - file is empty")
+                continue
+
+            # Check if required columns exist
+            if 'p' not in df.columns or 'selective_acc' not in df.columns:
+                print(f"  Skipping {filename} - missing required columns (p, selective_acc)")
+                print(f"    Available columns: {list(df.columns)}")
+                continue
+
+            lambda_val = params['lambda']
+            
+            if lambda_val not in lambda_data:
+                lambda_data[lambda_val] = []
+            
+            lambda_data[lambda_val].append(df)
+            print(f"  ✓ Loaded: λ={lambda_val}, γ={params.get('gamma', 'N/A')}, ETH={params.get('eth', 'N/A')} ({len(df)} rows)")
+
+        except Exception as e:
+            print(f"  ✗ Error reading {filepath}: {e}")
+
+    return lambda_data
+
+def plot_lambda_effect_simple(lambda_data, output_file, dataset_name='', eth_value=None, figsize=(10, 6)):
+    """Create a clean plot showing Test Accuracy vs ρ for different lambda values"""
+    
+    if not lambda_data:
+        print("No data to plot!")
+        return
+    
+    # Create figure with white background
+    fig, ax = plt.subplots(figsize=figsize, facecolor='white')
+    ax.set_facecolor('white')
+
+    # Define specific colors for lambda values (matching the reference plot)
+    lambda_vals_sorted = sorted(lambda_data.keys())
+    # Using distinct colors similar to the reference image
+    color_palette = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+                     '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+    colors = [color_palette[i % len(color_palette)] for i in range(len(lambda_vals_sorted))]
+
+    # Plot accuracy vs p for each lambda value
+    for idx, lambda_val in enumerate(lambda_vals_sorted):
+        dfs = lambda_data[lambda_val]
+        
+        # Combine all dataframes for this lambda
+        all_data = pd.concat(dfs, ignore_index=True)
+        
+        # Group by p and calculate mean accuracy
+        if 'p' in all_data.columns and 'selective_acc' in all_data.columns:
+            grouped = all_data.groupby('p')['selective_acc'].agg(['mean', 'std'])
+            
+            # Plot line with smooth appearance
+            ax.plot(grouped.index, grouped['mean'],
+                   linewidth=2.5,
+                   color=colors[idx],
+                   label=f'λ={lambda_val}',
+                   alpha=0.9)
+
+    # Formatting to match reference plot
+    ax.set_xlabel('Relative Portion of Out-of-Distribution Test Samples ρ', fontsize=12)
+    ax.set_ylabel('Test Accuracy', fontsize=12)
+
+    # Add title with ETH value if specified
+    title = 'Effect of λ in SplitGP'
+    if dataset_name and eth_value is not None:
+        title += f' ({dataset_name}, ETH={eth_value})'
+    elif dataset_name:
+        title += f' ({dataset_name})'
+    elif eth_value is not None:
+        title += f' (ETH={eth_value})'
+    ax.set_title(title, fontsize=14, fontweight='bold')
+
+    # Add grid
+    ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5, color='gray')
+
+    # Legend styling
+    ax.legend(loc='lower left', fontsize=10, framealpha=1.0,
+             edgecolor='black', fancybox=False)
+
+    # Set axis limits to match reference plot
+    ax.set_ylim([65, 100])
+    ax.set_xlim([0, 1.0])
+
+    # Set tick parameters
+    ax.tick_params(axis='both', which='major', labelsize=10)
+
+    # Add border
+    for spine in ax.spines.values():
+        spine.set_edgecolor('black')
+        spine.set_linewidth(1.0)
+
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"\n✅ Saved visualization to '{output_file}'")
+    
+    return fig
+
+def print_summary_table(lambda_data):
+    """Print a table similar to Table V from the paper"""
+    print("\n" + "="*90)
+    print("EFFECT OF λ - ACCURACY AT DIFFERENT ρ VALUES")
+    print("="*90)
+    
+    # Define p values to show
+    p_values = [0.0, 0.2, 0.4, 0.6, 0.8,1.0]
+    # Print header
+    header = f"{'Methods':<15} ||"
+    for p in p_values:
+        header += f"  ρ = {p:<5}"
+    print(header)
+    print("-" * 90)
+    
+    # Print data for each lambda
+    for lambda_val in sorted(lambda_data.keys()):
+        dfs = lambda_data[lambda_val]
+        all_data = pd.concat(dfs, ignore_index=True)
+        
+        row = f"λ = {lambda_val:<10} ||"
+        
+        if 'p' in all_data.columns and 'selective_acc' in all_data.columns:
+            for p in p_values:
+                # Find data points close to this p value
+                p_data = all_data[np.isclose(all_data['p'], p, atol=0.05)]
+                if not p_data.empty:
+                    acc = p_data['selective_acc'].mean()
+                    row += f"  {acc:6.2f}%"
+                else:
+                    row += f"  {'N/A':>7}"
+        
+        print(row)
+    
+    print("="*90)
+
+def main():
+    args = parse_args()
+    
+    # Parse figure size
+    figsize = tuple(map(float, args.figsize.split(',')))
+    
+    print("="*80)
+    print("LAMBDA EFFECT ANALYSIS")
+    print("="*80)
+    print(f"Base folder: {args.base_folder}")
+    print(f"Rounds filter: {args.rounds if args.rounds is not None else 'None (all values)'}")
+    print(f"Clients filter: {args.clients if args.clients is not None else 'None (all values)'}")
+    print(f"ETH filter: {args.eth if args.eth is not None else 'None (all values)'}")
+    print(f"Gamma filter: {args.gamma if args.gamma is not None else 'None (all values)'}")
+    print(f"Figure size: {figsize[0]}x{figsize[1]}")
+    print("="*80)
+    
+    # Load results
+    lambda_data = load_results(args.base_folder, args.rounds, args.clients, args.eth, args.gamma)
+
+    if not lambda_data:
+        print("\n❌ ERROR: No data found!")
+        print(f"Please check that the folder '{args.base_folder}' exists and contains results.")
+        print("\nTip: Try listing available folders with:")
+        print(f"  ls -la {args.base_folder}")
+        return
+    
+    print(f"\n✅ Found {len(lambda_data)} different lambda values: {sorted(lambda_data.keys())}")
+    
+    # Determine output path
+    if args.output == 'lambda_effect_plot.png' or '/' not in args.output:
+        dataset_part = args.dataset_name if args.dataset_name else 'dataset'
+        rounds_part = f'_rounds{args.rounds}' if args.rounds is not None else ''
+        clients_part = f'_clients{args.clients}' if args.clients is not None else ''
+        eth_part = f'_eth{args.eth}' if args.eth is not None else ''
+        gamma_part = f'_gamma{args.gamma}' if args.gamma is not None else ''
+        
+        if args.output == 'lambda_effect_plot.png':
+            output_filename = f'lambda_effect_{dataset_part}{rounds_part}{clients_part}{eth_part}{gamma_part}.png'
+        else:
+            output_filename = args.output
+        
+        output_path = os.path.join(args.base_folder, output_filename)
+    else:
+        output_path = args.output
+    
+    # Create visualization
+    plot_lambda_effect_simple(lambda_data, output_path, args.dataset_name, args.eth, figsize)
+
+    # Print summary table
+    print_summary_table(lambda_data)
+    
+    print("\n" + "="*80)
+    print("Analysis complete!")
+    print(f"📊 Visualization saved at: {os.path.abspath(output_path)}")
+    print("="*80)
+
+if __name__ == '__main__':
+    main()

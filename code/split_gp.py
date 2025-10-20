@@ -24,7 +24,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from fontTools.misc.cython import returns
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
@@ -38,9 +37,6 @@ import argparse
 # -------------------------
 
 
-
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print("Device:", DEVICE)
@@ -697,15 +693,14 @@ if __name__ == "__main__":
     p_values = [0.0 ,0.2,0.4,0.6,0.8,1.0]  # OOD fractions to evaluate
     OUT_DIR = f"{results_folder_name}/splitgp_vgg11_results_{DATASET}_method_{method}_rounds_{ROUNDS}_clients_{K}_model_split_index_{split_index}_gamma_{GAMMA}_lambda_split_{LAMBDA_SPLITGP}_ETH_{ETH}"
     print("Out dir",OUT_DIR)
-    list_of_previous_experiments = os.listdir(OUT_DIR)
 
-    if OUT_DIR in list_of_previous_experiments:
-        print(f"Experiment with name {OUT_DIR} already exists. Please choose a different name.")
-        exit(0)
+    # Check if the directory exists, if not, create it
+    if not os.path.exists(OUT_DIR):
+        os.makedirs(OUT_DIR)
+        print(f"Experiment directory {OUT_DIR} created.")
     else:
-        print(f"Experiment with name {OUT_DIR} will be created.")
-
-    os.makedirs(OUT_DIR, exist_ok=True)
+        print(f"Experiment directory {OUT_DIR} already exists. Please choose a different name or remove the existing directory.")
+        exit(0)
 
     # ---- Run methods ----
     methods_to_run = [args.method] if args.method != "all" else ["splitgp", "fedavg", "personalized", "multi-exit"]

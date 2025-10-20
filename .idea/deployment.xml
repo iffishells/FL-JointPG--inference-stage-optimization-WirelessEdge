@@ -1,9 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="Always" serverName="FL-joint" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
+  <component name="PublishConfigData" autoUpload="Always" serverName="psd-01" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false" showAutoUploadSettingsWarning="false">
     <option name="confirmBeforeUploading" value="false" />
     <serverData>
-      <paths name="FL-joint">
+      <paths name="psd-01">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/muhammad/code/FL-JointPG--inference-stage-optimization-WirelessEdge" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="psd02">
         <serverdata>
           <mappings>
             <mapping deploy="/home/muhammad/code/FL-JointPG--inference-stage-optimization-WirelessEdge" local="$PROJECT_DIR$" web="/" />
