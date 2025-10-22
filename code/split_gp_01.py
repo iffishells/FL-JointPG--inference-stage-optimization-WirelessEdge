@@ -39,7 +39,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run SplitGP/VGG11 experiments")
 
     # Experiment setup
-    parser.add_argument("--dataset", type=str, default="CIFAR10", choices=["MNIST", "FMNIST", "CIFAR10"],
+    parser.add_argument("--dataset", type=str, default="MNIST", choices=["MNIST", "FMNIST", "CIFAR10"],
                         help="Dataset to use")
     parser.add_argument("--clients", type=int, default=50, help="Number of clients (K)")
     parser.add_argument("--shards", type=int, default=100, help="Number of shards for non-IID split")
@@ -405,8 +405,10 @@ def train_split_training(in_channels, img_size, split_index,
             new_client_phi_states.append(new_phi)
             new_client_kappa_states.append(new_kappa)
 
-        # Keep global broadcast states unchanged (don't average them)
-        # phi_state and kappa_state stay the same for next round broadcast
+        # Update global broadcast states for next round (CRITICAL FIX)
+        # The global states should be the weighted averages for broadcasting
+        phi_state = avg_phi
+        kappa_state = avg_kappa
         clients_phi_states_cpu = new_client_phi_states
         clients_kappa_states_cpu = new_client_kappa_states
 
