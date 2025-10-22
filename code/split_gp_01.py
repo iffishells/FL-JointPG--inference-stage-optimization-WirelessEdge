@@ -14,8 +14,6 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from tqdm import tqdm
 import argparse
-
-import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--gpu", type=int, default=0)
 args, _ = parser.parse_known_args()
@@ -641,7 +639,8 @@ if __name__ == "__main__":
     p_values = [0,0.2,0.4,0.6,0.8,1.0]
 
     # ---- Run methods ----
-    methods_to_run = [args.method] if args.method != "all" else ["splitgp", "fedavg", "personalized", "multi-exit"]
+    # Only run SplitGP method since others have been removed
+    methods_to_run = ["splitgp"]
     print("method to run: ", methods_to_run)
     trainset, testset, IN_CHANNELS, IMG_SIZE = get_datasets(DATASET)
     train_labels = np.array(trainset.targets)
@@ -712,44 +711,6 @@ if __name__ == "__main__":
 
     results = defaultdict(list)
 
-    if "multi-exit" in methods_to_run:
-        # 1) Multi-Exit baseline (lambda=0 -> clients fully replaced by avg)
-        print("Training Multi-Exit (split, lambda=0) ...")
-        clients_phi_me, clients_kappa_me, server_theta_me = train_split_training(
-                                                                            in_channels=IN_CHANNELS,
-                                                                            img_size=IMG_SIZE,
-                                                                            split_index=split_index,
-                                                                            lambda_personalization=0.0,
-                                                                            gamma=GAMMA,
-                                                                            lr=LR,
-                                                                            batch=BATCH,
-                                                                            rounds=ROUNDS,
-                                                                            client_loader=client_loaders,
-                                                                            model_type=MODEL_TYPE
-                                                                            )
-
-        for p in p_values:
-            full_acc, client_acc, selective_acc = evaluate_method_split(clients_phi_me,
-                                                         clients_kappa_me,
-                                                         server_theta_me,
-                                                         per_p_testsets[p],
-                                                         in_channels=IN_CHANNELS,
-                                                         img_size=IMG_SIZE,
-                                                         split_index=split_index,
-                                                         threshold=ETH,
-                                                         batch_size=BATCH,
-                                                         model_type=MODEL_TYPE
-                                                         )
-            results['Multi-Exit'].append(full_acc)
-            # results['Multi-Exit-Clien'].append(client_acc)
-
-            print(f"p={p:.2f} Multi-Exit full acc: {full_acc:.4f}  client acc: {client_acc:.4f}, selective_acc : {selective_acc:.4f} ")
-
-        df = pd.DataFrame(results, index=p_values)
-        df.index.name = 'p'
-        csv_path = os.path.join(OUT_DIR, "multi-exit_combined_results_eth_{ETH}_gamma_{GAMMA}_lambda_split_{LAMBDA_SPLITGP}.csv")
-        df.to_csv(csv_path)
-        print("Saved CSV ->", csv_path)
 
     all_sweep_results = []
 
@@ -931,40 +892,3 @@ if __name__ == "__main__":
 
             print("\n✅ All SplitGP visualization plots created successfully!\n")
 
-
-    # Before saving any DataFrame to CSV, convert accuracy columns to percentage
-    accuracy_cols = ["selective_acc", "full_acc", "client_acc"]
-
-    def save_df_to_csv(df, csv_path):
-        for col in accuracy_cols:
-            if col in df.columns:
-                df[col] = df[col] * 100
-        df.to_csv(csv_path, index=False)
-
-    # Plot
-    # Plot results only if there are any methods in the results dict
-    if results:
-        print("Plotting results ...")
-        plt.figure(figsize=(10, 6))
-        for method_name, accs in results.items():
-            # Convert to percentage for plotting
-            accs_pct = [a * 100 for a in accs]
-            plt.plot(p_values, accs_pct, marker='o', label=method_name, linewidth=2)
-
-        plt.xlabel("p (OOD proportion)", fontsize=12)
-        plt.ylabel("Test Accuracy (%)", fontsize=12)
-        plt.title(f"{DATASET} - Accuracy vs OOD Proportion (p)", fontsize=14)
-        plt.xticks(p_values)
-        plt.ylim(0, 105)  # Set y-axis to 0-105% for better visualization
-        plt.grid(True, alpha=0.3)
-        plt.legend(fontsize=10)
-        plt.tight_layout()
-
-        plot_png = os.path.join(OUT_DIR, "accuracy_vs_p.png")
-        plot_pdf = os.path.join(OUT_DIR, "accuracy_vs_p.pdf")
-        plt.savefig(plot_png, dpi=300, bbox_inches='tight')
-        plt.savefig(plot_pdf, bbox_inches='tight')
-        print(f"Saved plot -> {plot_png}")
-        plt.close()
-    else:
-        print("No results to plot (results dict is empty).")
