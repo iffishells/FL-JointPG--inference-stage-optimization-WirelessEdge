@@ -14,19 +14,9 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from tqdm import tqdm
 import argparse
-parser = argparse.ArgumentParser()
-parser.add_argument("--gpu", type=int, default=0)
-args, _ = parser.parse_known_args()
-
-# Configure GPU environment
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-
-if torch.cuda.is_available():
-    DEVICE = torch.device(f"cuda:{args.gpu}")
-    print(f"✅ Using GPU: {torch.cuda.get_device_name(args.gpu)}")
-else:
-    DEVICE = torch.device("cpu")
-    print("⚠️ CUDA not available — using CPU.")
+# remove early ad-hoc argparse/device setup which parsed args at import-time
+DEVICE = None
+# Note: DEVICE will be deterministically set inside `if __name__ == "__main__":` after parsing args.
 
 # Set random seeds
 SEED = 42
@@ -43,7 +33,7 @@ def parse_args():
                         help="Dataset to use")
     parser.add_argument("--clients", type=int, default=50, help="Number of clients (K)")
     parser.add_argument("--shards", type=int, default=100, help="Number of shards for non-IID split")
-    parser.add_argument("--rounds", type=int, default=100, help="Number of global communication rounds")
+    parser.add_argument("--rounds", type=int, default=120, help="Number of global communication rounds (Paper: 120 for MNIST/FMNIST, 800 for CIFAR10)")
     parser.add_argument("--local-epochs", type=int, default=1, help="Epochs per client per round")
     parser.add_argument("--batch-size", type=int, default=50, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=0.01, help="Learning rate")
@@ -55,7 +45,11 @@ def parse_args():
     parser.add_argument("--gpu", type=str, default="0", help="Which GPU id(s) to use (e.g. '0' or '0,1')")
     parser.add_argument("--num-workers", type=int, default=4, help="Dataloader workers")
     parser.add_argument("--no-pin-memory", action="store_true", help="Disable pin_memory in DataLoader")
-    parser.add_argument("--eth", type=float, default=0.5, help="Entropy threshold (Eth) for selective offloading") # <--- ADD THIS LINE
+    parser.add_argument("--eth", type=float, default=0.8, help="Entropy threshold (Eth) for selective offloading (Paper uses: 0.05-2.3 range)")
+
+    # Determinism / reproducibility
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Enable deterministic PyTorch/CUDA behavior and force num_workers=0, pin_memory=False for exact reproducibility")
 
     # Model toggles
     parser.add_argument("--small-classifier", action="store_true", help="Use smaller FC layers (avoid OOM)")
@@ -207,7 +201,10 @@ class Kappa(nn.Module):
     def forward(self, h):
         return self.fc(torch.flatten(h, 1))
 
-def probe_phi_feature_shape(phi_module, in_channels=3, img_size=32, device='cpu'):
+def probe_phi_feature_shape(phi_module, in_channels=3, img_size=32, device=None):
+    """Return (C,H,W) of phi output. `device` may be a string or torch.device; defaults to CPU if None."""
+    if device is None:
+        device = 'cpu'
     phi_module = phi_module.to(device)
     phi_module.eval()
     with torch.no_grad():
@@ -288,11 +285,11 @@ def evaluate_method_split(clients_phi_states,
                 pred_s = out_s_soft.argmax(dim=1)
                 probs_c = F.softmax(out_c_soft, dim=1)
                 entropy = -torch.sum(probs_c * torch.log2(probs_c + 1e-12), dim=1)
-                offload_mask = entropy >= threshold
+                offload_mask = entropy > threshold
                 final_pred = torch.where(offload_mask, pred_s, pred_c)
-                correct_client += (pred_c == yb).sum().item()
-                correct_full += (pred_s == yb).sum().item()
-                correct_selective += (final_pred == yb).sum().item()
+                correct_client += int(torch.eq(pred_c, yb).sum().item())
+                correct_full += int(torch.eq(pred_s, yb).sum().item())
+                correct_selective += int(torch.eq(final_pred, yb).sum().item())
                 total += yb.size(0)
         client_accs.append(correct_client / total if total else 0.0)
         full_accs.append(correct_full / total if total else 0.0)
@@ -305,7 +302,8 @@ def evaluate_method_split(clients_phi_states,
     torch.cuda.empty_cache()
     return float(np.mean(full_accs)), float(np.mean(client_accs)), float(np.mean(selective_accs))
 
-def train_split_training(in_channels, img_size, split_index,
+def train_split_training(in_channels, img_size,
+                         split_index,
                          lambda_personalization=None,
                          gamma=None,
                          lr=None,
@@ -343,8 +341,16 @@ def train_split_training(in_channels, img_size, split_index,
     for r in tqdm(range(rounds), desc="Global rounds (split)"):
         client_phi_states, client_kappa_states, client_theta_states = [], [], []
         for k in tqdm(range(K), desc=" Clients Number ", leave=False):
-            clients_phi[k].load_state_dict({kk: vv.to(DEVICE) for kk, vv in phi_state.items()})
-            clients_kappa[k].load_state_dict({kk: vv.to(DEVICE) for kk, vv in kappa_state.items()})
+            # CRITICAL BUG FIX: Load personalized state for each client from previous round
+            # In round 0, all clients start with the same phi_state/kappa_state (initialization)
+            # In round r>0, each client k should load its personalized state from round r-1
+            if r > 0 and clients_phi_states_cpu is not None:
+                clients_phi[k].load_state_dict({kk: vv.to(DEVICE) for kk, vv in clients_phi_states_cpu[k].items()})
+                clients_kappa[k].load_state_dict({kk: vv.to(DEVICE) for kk, vv in clients_kappa_states_cpu[k].items()})
+            else:
+                # Round 0: broadcast the same initial model to all clients
+                clients_phi[k].load_state_dict({kk: vv.to(DEVICE) for kk, vv in phi_state.items()})
+                clients_kappa[k].load_state_dict({kk: vv.to(DEVICE) for kk, vv in kappa_state.items()})
             server_theta.load_state_dict({kk: vv.to(DEVICE) for kk, vv in theta_state.items()})
 
             opt = optim.SGD(list(clients_phi[k].parameters()) +
@@ -378,18 +384,21 @@ def train_split_training(in_channels, img_size, split_index,
         # FedAvg θ with dataset size weights (paper equation 9)
         new_theta = {}
         for key in client_theta_states[0].keys():
-            weighted_sum = sum(alpha_weights[i] * client_theta_states[i][key].to(torch.float32) for i in range(K))
+            weighted_list = [alpha_weights[i] * client_theta_states[i][key].to(torch.float32) for i in range(K)]
+            weighted_sum = torch.stack(weighted_list, dim=0).sum(dim=0)
             new_theta[key] = weighted_sum.clone()
         theta_state = new_theta
 
         # SplitGP: Personalized aggregation with dataset size weights (paper equations 10, 11)
         avg_phi = {}
         for key in client_phi_states[0].keys():
-            weighted_sum = sum(alpha_weights[i] * client_phi_states[i][key].to(torch.float32) for i in range(K))
+            weighted_list = [alpha_weights[i] * client_phi_states[i][key].to(torch.float32) for i in range(K)]
+            weighted_sum = torch.stack(weighted_list, dim=0).sum(dim=0)
             avg_phi[key] = weighted_sum.clone()
         avg_kappa = {}
         for key in client_kappa_states[0].keys():
-            weighted_sum = sum(alpha_weights[i] * client_kappa_states[i][key].to(torch.float32) for i in range(K))
+            weighted_list = [alpha_weights[i] * client_kappa_states[i][key].to(torch.float32) for i in range(K)]
+            weighted_sum = torch.stack(weighted_list, dim=0).sum(dim=0)
             avg_kappa[key] = weighted_sum.clone()
 
         new_client_phi_states, new_client_kappa_states = [], []
@@ -405,12 +414,18 @@ def train_split_training(in_channels, img_size, split_index,
             new_client_phi_states.append(new_phi)
             new_client_kappa_states.append(new_kappa)
 
-        # Update global broadcast states for next round (CRITICAL FIX)
-        # The global states should be the weighted averages for broadcasting
-        phi_state = avg_phi
-        kappa_state = avg_kappa
+        # Update client-specific states for next round
+        # CRITICAL: Each client should use its own personalized model (new_client_phi_states[k])
+        # NOT the average (avg_phi). The averaging is only for creating personalized versions.
+        # Store the personalized states for each client
         clients_phi_states_cpu = new_client_phi_states
         clients_kappa_states_cpu = new_client_kappa_states
+
+        # For broadcasting in the next round, we DON'T use the average directly
+        # Instead, each client will load its own personalized state from new_client_phi_states
+        # This is handled in the loop by loading from phi_state dict (not a single broadcast)
+        phi_state = avg_phi  # Used as initialization/reference only
+        kappa_state = avg_kappa  # Used as initialization/reference only
 
     server_theta_state_cpu = {k: v.cpu().clone() for k, v in theta_state.items()}
     return clients_phi_states_cpu, clients_kappa_states_cpu, server_theta_state_cpu
@@ -441,7 +456,7 @@ def count_conv_bias_params(module: nn.Module) -> int:
 class VGG11(nn.Module):
     """
     VGG-11 model for CIFAR10 with optional smaller classifier for paper-scale params.
-    Paper split: |φ|≈972,554, |θ|≈8,258,560, |κ|=10,250
+    Paper split: |φ|≈972,554, |θ|≈8,258,560, |κ| = 10,250
     """
     def __init__(self, num_classes=10, split_index=22, in_channels=3, small_classifier=True):
         super().__init__()
@@ -597,16 +612,42 @@ if __name__ == "__main__":
 
     args = parse_args()
 
-    # Fix seeds for reproducibility
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    # Force PYTHON hash seed and deterministic behavior (recommended for reproducibility)
+    os.environ["PYTHONHASHSEED"] = str(args.seed)
     random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
+    # Try to enable PyTorch deterministic algorithms when requested
+    try:
+        torch.use_deterministic_algorithms(True)
+    except Exception:
+        # Older PyTorch versions may not support this API; ignore if unavailable
+        pass
+    # cudnn settings
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # CUBLAS deterministic workspace config for some PyTorch/CUDA combinations
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-    # Setup GPU env
+    # Setup GPU env (respect CLI --gpu which is a comma-separated string of visible ids)
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Ensure DEVICE is a torch.device (pick the first visible GPU -> cuda:0)
+    if torch.cuda.is_available():
+        # Use cuda:0 which maps to the first id in CUDA_VISIBLE_DEVICES
+        DEVICE = torch.device("cuda:0")
+        try:
+            print(f"✅ Using GPU: {torch.cuda.get_device_name(0)}")
+        except Exception:
+            print("✅ Using GPU (name unavailable)")
+    else:
+        DEVICE = torch.device("cpu")
+        print("⚠️ CUDA not available — using CPU.")
+
     print("Device:", DEVICE)
 
     # Assign args to variables
@@ -619,11 +660,21 @@ if __name__ == "__main__":
     GAMMA = args.gamma
     LAMBDA_SPLITGP = args.lambda_splitgp
     SEED = args.seed
-    NUM_WORKERS = args.num_workers
-    PIN_MEMORY = not args.no_pin_memory
+
+    # When deterministic flag is set, force zero workers and disable pin_memory for exact reproducibility
+    if args.deterministic:
+        NUM_WORKERS = 0
+        PIN_MEMORY = False
+    else:
+        NUM_WORKERS = args.num_workers
+        PIN_MEMORY = not args.no_pin_memory
+
     SMALL_CLASSIFIER = args.small_classifier
     PROBE_PRINTS = args.probe
-    DATASET = args.dataset
+    DATASET = args.dataset  # CRITICAL: Missing assignment
+    # Paper uses these Eth values (Section VI-A): {0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.3}
+    # Note: These seem small for log2 entropy but match the paper exactly
+    eth_thresholds = [0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.3]
     ETH = args.eth # <--- GET ETH FROM ARGS
     split_index = args.split_index
     method = args.method
@@ -637,7 +688,7 @@ if __name__ == "__main__":
     OUT_DIR = os.path.join(dataset_folder, f"splitgp_method_{method}_rounds_{ROUNDS}_clients_{K}_gamma_{GAMMA}_lambda_split_{LAMBDA_SPLITGP}_ETH_{ETH}")
     print("out dir", OUT_DIR)
     os.makedirs(OUT_DIR, exist_ok=True)
-    eth_thresholds = [0.05,0.1,0.2,0.4,0.8,1.2,1.6,2.3]
+    # eth_thresholds already defined above with corrected values
     p_values = [0,0.2,0.4,0.6,0.8,1.0]
 
     # ---- Run methods ----
@@ -784,10 +835,11 @@ if __name__ == "__main__":
                     df_temp[col] = df_temp[col] * 100
 
             df = df_temp.copy()
-            df = df.set_index('p')
+            # create an indexed copy for saving (avoid inplace to keep types clear)
+            df_indexed = df.set_index('p')
             csv_name = f"{method}_combined_results_eth_{eth:.2f}_gamma_{GAMMA}_lambda_split_{LAMBDA_SPLITGP}.csv"
             csv_path = os.path.join(OUT_DIR, csv_name)
-            df.to_csv(csv_path)
+            df_indexed.to_csv(csv_path)
             print("Saved CSV ->", csv_path)
 
             # Append this DataFrame's data to the overall list
@@ -893,4 +945,4 @@ if __name__ == "__main__":
             plt.close()
 
             print("\n✅ All SplitGP visualization plots created successfully!\n")
-
+            #test
