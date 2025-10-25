@@ -34,7 +34,8 @@ def parse_args():
     parser.add_argument("--clients", type=int, default=50, help="Number of clients (K)")
     parser.add_argument("--shards", type=int, default=100, help="Number of shards for non-IID split")
     parser.add_argument("--rounds", type=int, default=120, help="Number of global communication rounds (Paper: 120 for MNIST/FMNIST, 800 for CIFAR10)")
-    parser.add_argument("--local-epochs", type=int, default=1, help="Epochs per client per round")
+    parser.add_argument("--local-epochs", type=int, default=1, help="Epochs per client per round (paper uses 1, but may need 0.5 for MNIST to match 12 updates)")
+    parser.add_argument("--max-local-updates", type=int, default=None, help="Max local updates per round (paper: 12 for MNIST, 10 for CIFAR10). If set, overrides local-epochs.")
     parser.add_argument("--batch-size", type=int, default=50, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=0.01, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.5, help="Weight between client-side and server-side loss")
@@ -42,7 +43,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
     # Hardware
-    parser.add_argument("--gpu", type=str, default="0", help="Which GPU id(s) to use (e.g. '0' or '0,1')")
+    parser.add_argument("--gpu", type=str, default="1", help="Which GPU id(s) to use (e.g. '0' or '0,1')")
     parser.add_argument("--num-workers", type=int, default=4, help="Dataloader workers")
     parser.add_argument("--no-pin-memory", action="store_true", help="Disable pin_memory in DataLoader")
     parser.add_argument("--eth", type=float, default=0.8, help="Entropy threshold (Eth) for selective offloading (Paper uses: 0.05-2.3 range)")
@@ -310,8 +311,16 @@ def train_split_training(in_channels, img_size,
                          batch=None,
                          rounds=None,
                          client_loader=None,
+                         local_epochs=1,
+                         max_local_updates=None,
                          model_type='SimpleCNN'):
-    """SplitGP style training. Returns client φ/κ and server θ states (CPU)."""
+    """
+    SplitGP style training. Returns client φ/κ and server θ states (CPU).
+
+    Args:
+        max_local_updates: If set, limits the number of gradient updates per client per round.
+                          Paper uses 12 for MNIST/FMNIST, 10 for CIFAR10.
+    """
     if client_loader is None:
         raise ValueError("client_loaders must be provided (list or dict of DataLoaders indexed by client id)")
 
@@ -360,11 +369,26 @@ def train_split_training(in_channels, img_size,
             loader = client_loader[k]
             clients_phi[k].train(); clients_kappa[k].train(); server_theta.train()
 
-            for _ in range(LOCAL_EPOCHS):
+            update_count = 0
+            for epoch in range(local_epochs):
                 for xb, yb in loader:
                     xb = xb.to(DEVICE)
                     if not torch.is_tensor(yb): yb = torch.tensor(yb, dtype=torch.long)
                     yb = yb.to(DEVICE)
+                    h = clients_phi[k](xb)
+                    out_c = clients_kappa[k](h)
+                    out_s = server_theta(h)
+                    loss = gamma * F.cross_entropy(out_c, yb) + (1.0 - gamma) * F.cross_entropy(out_s, yb)
+                    opt.zero_grad(); loss.backward(); opt.step()
+
+                    update_count += 1
+                    # If max_local_updates is set, stop after reaching the limit
+                    if max_local_updates is not None and update_count >= max_local_updates:
+                        break
+
+                # Break outer loop if we've reached max updates
+                if max_local_updates is not None and update_count >= max_local_updates:
+                    break
                     h = clients_phi[k](xb)
                     out_c = clients_kappa[k](h)
                     out_s = server_theta(h)
@@ -637,23 +661,6 @@ def create_theta(cnn_model, model_type='SimpleCNN', split_index=None):
         return VGG11_Theta(cnn_model, split_index=split_index)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
-    """Factory function to create Phi (client-side feature extractor)"""
-    if model_type.lower() == 'simplecnn':
-        return Phi(cnn_model)
-    elif model_type.lower() in ['vgg11', 'vgg-11']:
-        return VGG11_Phi(cnn_model, split_index=split_index)
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
-
-
-def create_theta(cnn_model, model_type='SimpleCNN', split_index=22):
-    """Factory function to create Theta (server-side model)"""
-    if model_type.lower() == 'simplecnn':
-        return Theta(cnn_model)
-    elif model_type.lower() in ['vgg11', 'vgg-11']:
-        return VGG11_Theta(cnn_model, split_index=split_index)
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
 
 
 def create_kappa(feature_shape, model_type='SimpleCNN', num_classes=10):
@@ -731,6 +738,19 @@ if __name__ == "__main__":
     # Assign args to variables
     K = args.clients
     SHARDS = args.shards
+    DATASET = args.dataset
+
+    # Paper-specific local updates: 12 for MNIST/FMNIST, 10 for CIFAR10
+    # Use max_local_updates if specified, otherwise use local_epochs
+    MAX_LOCAL_UPDATES = args.max_local_updates
+    if MAX_LOCAL_UPDATES is None and DATASET in ['MNIST', 'FMNIST']:
+        # Automatically set to 12 for MNIST/FMNIST to match paper
+        MAX_LOCAL_UPDATES = 12
+        print(f"⚙️  Auto-setting max_local_updates={MAX_LOCAL_UPDATES} for {DATASET} (paper configuration)")
+    elif MAX_LOCAL_UPDATES is None and DATASET == 'CIFAR10':
+        # Automatically set to 10 for CIFAR10 to match paper
+        MAX_LOCAL_UPDATES = 10
+        print(f"⚙️  Auto-setting max_local_updates={MAX_LOCAL_UPDATES} for {DATASET} (paper configuration)")  # CRITICAL: Missing assignment
     ROUNDS = args.rounds
     LOCAL_EPOCHS = args.local_epochs
     BATCH = args.batch_size
@@ -757,15 +777,48 @@ if __name__ == "__main__":
     split_index = args.split_index
     method = args.method
     MODEL_TYPE = args.model  # Use model type from command-line argument
+
+    # Create hierarchical results directory structure:
+    # results/Model/Dataset/Method/rounds_X/lambda_Y/
+    # Example: results/SimpleCNN/FMNIST/splitgp/rounds_120/lambda_0.2/
     results_folder_name = "results"
     os.makedirs(results_folder_name, exist_ok=True)
+
+    # Level 1: Model (SimpleCNN, VGG11, etc.)
     model_folder = os.path.join(results_folder_name, MODEL_TYPE)
     os.makedirs(model_folder, exist_ok=True)
+
+    # Level 2: Dataset (MNIST, FMNIST, CIFAR10)
     dataset_folder = os.path.join(model_folder, DATASET)
     os.makedirs(dataset_folder, exist_ok=True)
-    OUT_DIR = os.path.join(dataset_folder, f"splitgp_method_{method}_rounds_{ROUNDS}_clients_{K}_gamma_{GAMMA}_lambda_split_{LAMBDA_SPLITGP}_ETH_{ETH}")
-    print("out dir", OUT_DIR)
+
+    # Level 3: Method (splitgp, fedavg, personalized, etc.)
+    method_folder = os.path.join(dataset_folder, method)
+    os.makedirs(method_folder, exist_ok=True)
+
+    # Level 4: Rounds
+    rounds_folder = os.path.join(method_folder, f"rounds_{ROUNDS}")
+    os.makedirs(rounds_folder, exist_ok=True)
+
+    # Level 5: Lambda (personalization parameter)
+    lambda_folder = os.path.join(rounds_folder, f"lambda_{LAMBDA_SPLITGP}")
+    os.makedirs(lambda_folder, exist_ok=True)
+
+    # Final output directory with additional parameters
+    OUT_DIR = os.path.join(lambda_folder, f"clients_{K}_gamma_{GAMMA}_ETH_{ETH}")
     os.makedirs(OUT_DIR, exist_ok=True)
+
+    print("="*70)
+    print("Results Directory Structure:")
+    print(f"  {MODEL_TYPE}/")
+    print(f"    └── {DATASET}/")
+    print(f"        └── {method}/")
+    print(f"            └── rounds_{ROUNDS}/")
+    print(f"                └── lambda_{LAMBDA_SPLITGP}/")
+    print(f"                    └── clients_{K}_gamma_{GAMMA}_ETH_{ETH}/")
+    print()
+    print(f"Full path: {OUT_DIR}")
+    print("="*70)
     # eth_thresholds already defined above with corrected values
     p_values = [0,0.2,0.4,0.6,0.8,1.0]
 
@@ -826,6 +879,8 @@ if __name__ == "__main__":
             approx_paper_theta = theta_tail_params - (theta_tail_bn_affine or 0)
             f.write(f"Approx. paper Theta (features only, no BN affine, no classifier): {approx_paper_theta}\n")
             approx_paper_theta_strict = theta_tail_params - (theta_tail_bn_affine or 0) - (theta_tail_conv_bias or 0)
+            local_epochs=LOCAL_EPOCHS,
+            max_local_updates=MAX_LOCAL_UPDATES,
             f.write(f"Approx. paper Theta strict (features only, no BN affine, no conv bias, no classifier): {approx_paper_theta_strict}\n")
 
     if PROBE_PRINTS:
