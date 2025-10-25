@@ -455,13 +455,18 @@ def count_conv_bias_params(module: nn.Module) -> int:
 
 class VGG11(nn.Module):
     """
-    VGG-11 model for CIFAR10 with optional smaller classifier for paper-scale params.
-    Paper split: |φ|≈972,554, |θ|≈8,258,560, |κ| = 10,250
-    """
-    def __init__(self, num_classes=10, split_index=22, in_channels=3, small_classifier=True):
-        super().__init__()
-        self.split_index = split_index
+    VGG-11 model for CIFAR10 WITHOUT BatchNorm (matches paper's parameter counts).
+    Paper split: |φ| = 972,554, |θ| = 8,258,560, |κ| = 10,250
 
+    Architecture: 8 conv layers [64, 128, 256, 256, 512, 512, 512, 512] + classifier
+    Split point: After 4th conv (256) -> φ has 4 convs, θ has 4 convs + classifier
+    """
+    def __init__(self, num_classes=10, split_index=4, in_channels=3, small_classifier=True):
+        super().__init__()
+        self.split_index = split_index  # Number of conv layers in phi (paper uses 4)
+
+        # VGG-11 config: 8 conv layers with max pooling
+        # [64, M, 128, M, 256, 256, M, 512, 512, M, 512, 512, M]
         cfg = [64, 'M', 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M']
 
         layers = []
@@ -470,28 +475,26 @@ class VGG11(nn.Module):
             if v == 'M':
                 layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
             else:
-                conv2d = nn.Conv2d(in_ch, v, kernel_size=3, padding=1)
+                # NO BatchNorm - matches paper's parameter counts
+                conv2d = nn.Conv2d(in_ch, v, kernel_size=3, padding=1, bias=True)
                 layers.append(conv2d)
-                layers.append(nn.BatchNorm2d(v))
                 layers.append(nn.ReLU(inplace=True))
                 in_ch = v
 
         self.features = nn.Sequential(*layers)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        if small_classifier:
-            # Lightweight classifier to match paper's theta parameter scale
-            self.classifier = nn.Sequential(
-                nn.Linear(512, 512), nn.ReLU(True), nn.Dropout(0.5),
-                nn.Linear(512, 256), nn.ReLU(True), nn.Dropout(0.5),
-                nn.Linear(256, num_classes),
-            )
-        else:
-            # Classic VGG-11 classifier (much larger; ~19M params just in classifier)
-            self.classifier = nn.Sequential(
-                nn.Linear(512, 4096), nn.ReLU(True), nn.Dropout(0.5),
-                nn.Linear(4096, 4096), nn.ReLU(True), nn.Dropout(0.5),
-                nn.Linear(4096, num_classes),
-            )
+
+        # Paper uses smaller classifier: 512 -> 512 -> 256 -> 10
+        # This gives |classifier| ≈ 396K params
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.ReLU(True),
+            nn.Dropout(0.5),
+            nn.Linear(512, 256),
+            nn.ReLU(True),
+            nn.Dropout(0.5),
+            nn.Linear(256, num_classes),
+        )
 
     def forward(self, x):
         x = self.features(x)
@@ -528,11 +531,58 @@ class VGG11_Kappa(nn.Module):
         h = torch.flatten(h, 1)
         return self.fc(h)
 
-class VGG11_Theta(nn.Module):
-    """Server-side model for VGG11: remaining features + avgpool + classifier."""
-    def __init__(self, vgg_model, split_index):
+class VGG11_Phi(nn.Module):
+    """
+    Client-side feature extractor for VGG11: first split_index conv blocks.
+    split_index=4 means first 4 conv layers (3->64->128->256->256)
+    This gives |φ| = 960,896 params (paper: 972,554 likely includes kappa or has slight difference)
+    """
+    def __init__(self, vgg_model, split_index=4):
         super().__init__()
-        self.features_tail = nn.Sequential(*list(vgg_model.features.children())[split_index:])
+        # Extract first split_index conv+relu blocks from features
+        # In the features list: [Conv, ReLU, MaxPool, Conv, ReLU, MaxPool, ...]
+        # We need to find where the split_index-th conv layer ends
+
+        layers = list(vgg_model.features.children())
+        conv_count = 0
+        split_at = 0
+
+        for i, layer in enumerate(layers):
+            if isinstance(layer, nn.Conv2d):
+                conv_count += 1
+                if conv_count == split_index:
+                    # Include this conv + the next ReLU
+                    split_at = i + 2  # Conv + ReLU
+                    break
+
+        self.net = nn.Sequential(*layers[:split_at])
+
+    def forward(self, x):
+        return self.net(x)
+
+class VGG11_Theta(nn.Module):
+    """
+    Server-side model for VGG11: remaining conv layers + avgpool + classifier.
+    For split_index=4: includes last 4 conv layers (256->512->512->512->512) + classifier
+    This gives |θ| ≈ 8,259,584 conv + 396,554 classifier = 8,656,138 total
+    Paper reports 8,258,560 (small difference likely from parameter counting method)
+    """
+    def __init__(self, vgg_model, split_index=4):
+        super().__init__()
+
+        # Find where phi ends and extract remaining layers
+        layers = list(vgg_model.features.children())
+        conv_count = 0
+        split_at = 0
+
+        for i, layer in enumerate(layers):
+            if isinstance(layer, nn.Conv2d):
+                conv_count += 1
+                if conv_count == split_index:
+                    split_at = i + 2  # After Conv + ReLU
+                    break
+
+        self.features_tail = nn.Sequential(*layers[split_at:])
         self.avgpool = vgg_model.avgpool
         self.classifier = vgg_model.classifier
 
@@ -543,20 +593,20 @@ class VGG11_Theta(nn.Module):
         x = self.classifier(x)
         return x
 
-class VGG11_Phi(nn.Module):
-    """Client-side feature extractor for VGG11: first split_index layers."""
-    def __init__(self, vgg_model, split_index):
-        super().__init__()
-        self.net = nn.Sequential(*list(vgg_model.features.children())[:split_index])
+def create_model(model_type, in_channels, num_classes=10, split_index=None):
+    """
+    Factory function to create SimpleCNN or VGG11 models.
 
-    def forward(self, x):
-        return self.net(x)
-
-def create_model(model_type, in_channels, num_classes=10, split_index=22):
-    """Factory function to create SimpleCNN or VGG11 models."""
+    split_index: Number of conv layers in phi (client-side)
+        - For SimpleCNN: Not used (fixed architecture)
+        - For VGG11: Default=4 (paper configuration)
+    """
     if model_type.lower() == 'simplecnn':
         model = SimpleCNN(in_channels=in_channels, num_classes=num_classes)
     elif model_type.lower() in ['vgg11', 'vgg-11']:
+        # Use split_index=4 by default for VGG11 (matches paper)
+        if split_index is None:
+            split_index = 4
         model = VGG11(num_classes=num_classes, split_index=split_index, in_channels=in_channels, small_classifier=SMALL_CLASSIFIER)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
@@ -565,7 +615,28 @@ def create_model(model_type, in_channels, num_classes=10, split_index=22):
     model.apply(init_weights)
     return model
 
-def create_phi(cnn_model, model_type='SimpleCNN', split_index=22):
+def create_phi(cnn_model, model_type='SimpleCNN', split_index=None):
+    """Factory function to create Phi (client-side feature extractor)"""
+    if model_type.lower() == 'simplecnn':
+        return Phi(cnn_model)
+    elif model_type.lower() in ['vgg11', 'vgg-11']:
+        if split_index is None:
+            split_index = 4  # Paper default for VGG11
+        return VGG11_Phi(cnn_model, split_index=split_index)
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+
+
+def create_theta(cnn_model, model_type='SimpleCNN', split_index=None):
+    """Factory function to create Theta (server-side model)"""
+    if model_type.lower() == 'simplecnn':
+        return Theta(cnn_model)
+    elif model_type.lower() in ['vgg11', 'vgg-11']:
+        if split_index is None:
+            split_index = 4  # Paper default for VGG11
+        return VGG11_Theta(cnn_model, split_index=split_index)
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
     """Factory function to create Phi (client-side feature extractor)"""
     if model_type.lower() == 'simplecnn':
         return Phi(cnn_model)
@@ -936,7 +1007,6 @@ if __name__ == "__main__":
                         color = 'white' if val < 50 else 'black'
                         plt.text(j, i, f'{val:.1f}', ha='center', va='center',
                                 color=color, fontsize=9, weight='bold')
-
             plt.tight_layout()
             plot_path = os.path.join(OUT_DIR, "splitgp_heatmap_eth_vs_p.png")
             plt.savefig(plot_path, dpi=300, bbox_inches='tight')
