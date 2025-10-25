@@ -691,12 +691,19 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    # Try to enable PyTorch deterministic algorithms when requested
+    # Enable PyTorch deterministic algorithms with warn_only mode
+    # This is necessary because some operations (like adaptive_avg_pool2d on CUDA used in VGG-11)
+    # don't have deterministic implementations
     try:
-        torch.use_deterministic_algorithms(True)
-    except Exception:
-        # Older PyTorch versions may not support this API; ignore if unavailable
-        pass
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except TypeError:
+        # Older PyTorch versions don't support warn_only parameter
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception:
+            # If it fails, continue without strict determinism
+            pass
+    
     # cudnn settings
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
@@ -1016,3 +1023,4 @@ if __name__ == "__main__":
 
             print("\n✅ All SplitGP visualization plots created successfully!\n")
             #test
+            # test
