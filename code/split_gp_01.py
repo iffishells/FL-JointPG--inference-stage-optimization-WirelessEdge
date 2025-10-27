@@ -406,6 +406,7 @@ def train_split_training(in_channels, img_size,
                     if max_local_updates is not None and update_count >= max_local_updates:
                         break
 
+
                 # Break outer loop if we've reached max updates
                 if max_local_updates is not None and update_count >= max_local_updates:
                     break
