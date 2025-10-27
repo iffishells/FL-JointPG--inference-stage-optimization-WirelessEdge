@@ -15,9 +15,7 @@ import pandas as pd
 from tqdm import tqdm
 import argparse
 
-# remove early ad-hoc argparse/device setup which parsed args at import-time
 DEVICE = None
-# Note: DEVICE will be deterministically set inside `if __name__ == "__main__":` after parsing args.
 
 # Set random seeds
 SEED = 42
@@ -129,10 +127,6 @@ class SimpleCNN(nn.Module):
 
     def __init__(self, in_channels=1, num_classes=10):
         super().__init__()
-        # Paper uses 5x5 kernels, not 3x3
-        # Architecture designed to match exact parameter counts:
-        # |φ| = 387,840, |θ| = 3,480,330, |κ| = 23,050
-
         # Client-side φ: 4 convolutional layers
         self.conv1 = nn.Conv2d(in_channels, 64, 5, padding=2)  # 5x5 kernel
         self.conv2 = nn.Conv2d(64, 64, 5, padding=2)  # 5x5 kernel
@@ -526,7 +520,8 @@ class VGG11(nn.Module):
 
         # VGG-11 config: 8 conv layers with max pooling
         # [64, M, 128, M, 256, 256, M, 512, 512, M, 512, 512, M]
-        cfg = [64, 'M', 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M']
+        cfg = [64, 'M',
+               128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M']
 
         layers = []
         in_ch = in_channels
@@ -817,7 +812,7 @@ if __name__ == "__main__":
 
     SMALL_CLASSIFIER = args.small_classifier
     PROBE_PRINTS = args.probe
-    DATASET = args.dataset  # CRITICAL: Missing assignment
+    # DATASET already assigned earlier; no need to reassign here
     # Paper uses these Eth values (Section VI-A): {0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.3}
     # Note: These seem small for log2 entropy but match the paper exactly
     eth_thresholds = [0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.3]
@@ -927,10 +922,11 @@ if __name__ == "__main__":
             approx_paper_theta = theta_tail_params - (theta_tail_bn_affine or 0)
             f.write(f"Approx. paper Theta (features only, no BN affine, no classifier): {approx_paper_theta}\n")
             approx_paper_theta_strict = theta_tail_params - (theta_tail_bn_affine or 0) - (theta_tail_conv_bias or 0)
-            local_epochs = LOCAL_EPOCHS,
-            max_local_updates = MAX_LOCAL_UPDATES,
+            # Write additional runtime config used for training so results are reproducible
             f.write(
                 f"Approx. paper Theta strict (features only, no BN affine, no conv bias, no classifier): {approx_paper_theta_strict}\n")
+            f.write(f"Local epochs (LOCAL_EPOCHS): {LOCAL_EPOCHS}\n")
+            f.write(f"Max local updates (MAX_LOCAL_UPDATES): {MAX_LOCAL_UPDATES}\n")
 
     if PROBE_PRINTS:
         print("Probe phi output feature shape (C,H,W):", feat_shape)
@@ -960,6 +956,8 @@ if __name__ == "__main__":
             batch=BATCH,
             rounds=ROUNDS,
             client_loader=client_loaders,
+            local_epochs=LOCAL_EPOCHS,
+            max_local_updates=MAX_LOCAL_UPDATES,
             model_type=MODEL_TYPE
         )
 
