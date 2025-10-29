@@ -1,3 +1,10 @@
+
+*.pdf
+*.png
+*.txt
+*.csv
+*.tex
+*.idea
 code/plots/*
 code/results/*
 code/*.png
